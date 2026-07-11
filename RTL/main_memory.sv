@@ -19,7 +19,7 @@ module main_memory
     localparam WORD_AW = $clog2(MEM_DEPTH); // width of word address, not byte address
     localparam BYTE_OFF = $clog2(DATA_WIDTH/8); // BYTE_OFF = 2. byte offset that differentiates word address and byte address
     // 64KB address space
-    (* ram_style = "block" *) logic [DATA_WIDTH-1:0] ram [0:MEM_DEPTH-1]; 
+    (* ram_style = "block" *) logic [DATA_WIDTH-1:0] ram [0:MEM_DEPTH-1];
     
     initial begin // initialize main memory
         $readmemh("initial_ram.hex", ram);
@@ -34,8 +34,7 @@ module main_memory
         ACK     = 3'd4
     } state_t;
 
-    state_t state;
-    state_t next_state;
+    state_t state, next_state;
 
     // break down needed channel A inputs
     logic [ADDR_WIDTH-1:0]    saved_addr; // register for address when it needs to be captured
