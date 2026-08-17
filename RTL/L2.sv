@@ -80,13 +80,12 @@ module l2_cache
     // combinational signals
     logic [L2_LINE_AW-1:0] base_line_addr;   // line address into BRAM (set*WAYS + way),
                                               // will be driven in the sequential block
-    logic                  last_beat;
+    logic                   last_beat;
     logic [OFFSET_BITS-1:0] offset;
     logic [INDEX_BITS-1:0]  index;
     logic [TAG_BITS-1:0]    tag;
     logic                   hit_way0, hit_way1;
     logic                   hit;
-    logic                   hit_way;          // which way had the hit (0 or 1)
 
     assign last_beat = (beat_count == BEATS-1);
 
@@ -101,7 +100,6 @@ module l2_cache
     assign hit_way1 = valid_array[{index, 1'b1}] &&
                       (l2_tag[{index, 1'b1}] == tag); // append 1 for all Way1 in a set because set*ways is ordered with a one at the end
     assign hit      = hit_way0 || hit_way1;
-    assign hit_way  = hit_way1 ? 1'b1 : 1'b0;
 
     assign a_L1_ready = (state == IDLE);
 

@@ -121,4 +121,15 @@ package tilelink_pkg;
         logic [SINK_WIDTH-1:0] sink; // sends save value as sink on channel D back to D as grant ack.
     } channel_e;
 
+    // cpu requests and responses
+    typedef struct packed {
+        logic                  opcode;
+        logic [ADDR_WIDTH-1:0] addr;
+        logic [DATA_WIDTH-1:0] st_data;
+    } cpu_req_t;
+
+    typedef struct packed {
+        logic [DATA_WIDTH-1:0] rdata;
+        logic                  stall;
+    } cpu_resp_t;
 endpackage
