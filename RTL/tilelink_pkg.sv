@@ -1,14 +1,14 @@
 package tilelink_pkg;
     // channel width parameters
     parameter int ADDR_WIDTH = 16; // address width of main memory
-    parameter int DATA_WIDTH = 32; // data is 32 bits = 4 bytez
+    parameter int DATA_WIDTH = 32; // data is 32 bits = 4 bytes
     parameter int LINE_BYTES = 16; // 16 bytes per cache line
     parameter int SIZE_WIDTH = 3; // size = 4 (log2(16)) so 3 bits needed
     local parameter int BEATS = LINE_BYTES/(DATA_WIDTH/8); // data path is 4 bytes, need to transfer 16 bytes = 4 beats total
     local parameter int SOURCE_WIDTH = 2; // L2 communicates with 4 L1s so 2 bits needed
     local parameter int SINK_WIDTH = 2; // each L1 can have an outstanding grant, so 4 total = 2 bits
     local parameter int OPCODE_WIDTH = 3; // 3 bits for the opcode
-    local parameter int PARAM_WIDTH = 3; // 3 bits for parameter (permission) changes changes
+    local parameter int PARAM_WIDTH = 3; // 3 bits for parameter (permission) changes
 
     // CHANNEL A OPCODES (master -> student)
     local parameter logic [2:0] PUT_FULL_DATA = 3'd0; // L2 writes full line back to main memory
