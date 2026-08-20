@@ -126,13 +126,6 @@ import tilelink_pkg::*;
     assign chan_d_ready = (miss_state == WAIT);
     assign chan_e_valid = (miss_state == ACK);
 
-    // Channel B/C (Probe/ProbeAck) aren't handled by this FSM - that's a
-    // separate listener that needs to run concurrently with this one. Tie
-    // off for now so these outputs aren't left floating.
-    assign chan_b_ready = 1'b0;
-    assign chan_c        = '0;
-    assign chan_c_valid  = 1'b0;
-
     // ------------------------------------------------------------------
     // Next-state logic only - no output driving here
     // ------------------------------------------------------------------
@@ -249,4 +242,65 @@ import tilelink_pkg::*;
             endcase
         end
     end
+
+    // CHANNEL B-C TRANSACTION
+
+    // registerd copy of channel b signals
+    logic [OPCODE_WIDTH-1:0]    probe_opcode;
+    logic [PARAM_WIDTH-1:0]     probe_param;
+    logic [SIZE_WIDTH-1:0]      probe_size;
+    logic [SOURCE_WIDTH-1:0]    probe_source;
+    logic [ADDR_WIDTH-1:0]      probe_addr;
+    logic [DATA_WIDTH-1:0]      probe_data;
+
+    // own beat counter for ProbeAckData because it must not share the miss FSM's
+    // beat_count/last_beat, since a probe can be in flight independently of an Acquire
+    logic [BEAT_BITS-1:0] probe_beat_count;
+    logic                 probe_last_beat;
+    assign probe_last_beat = (probe_beat_count == BEATS-1);
+
+    typedef enum logic [1:0] {
+        PROBE_IDLE, PROBE_RECEIVE, PROBE_SEND
+    } b_probe_t;
+
+    b_probe_t probe_state;
+    b_probe_t next_probe_state;
+
+    // ready/valid for the channels this FSM drives, straight off the state -
+    // same pattern as chan_a_valid/chan_d_ready/chan_e_valid above
+    assign chan_b_ready = (probe_state == PROBE_RECEIVE);
+    assign chan_c_valid = (probe_state == PROBE_SEND);
+
+    always_ff @(posedge clk) begin
+        if (rst) probe_state <= PROBE_IDLE;
+        else probe_state <= next_probe_state;
+    end
+
+    always_comb begin
+        next_probe_state = probe_state;
+        case (probe_state)
+            PROBE_IDLE: begin
+                if (chan_b_valid) next_probe_state = PROBE_RECEIVE;
+            end
+
+            PROBE_RECEIVE: begin
+                if (chan_b_valid && chan_b_ready) next_probe_state = PROBE_SEND;
+            end
+
+            PROBE_SEND: begin
+              // no neeed for acknowledge state here because channel C is the acknowledgement
+              // There is no channel E equivalent
+                if (chan_c_valid && chan_c_ready) begin
+                    case (probe_opcode)
+                        PROBE_BLOCK: if (probe_last_beat) next_probe_state = PROBE_IDLE;
+                        PROBE_PERM: next_probe_state = PROBE_IDLE;
+                        default: next_probe_state = PROBE_IDLE;
+                    endcase
+                end
+            end
+
+            default: next_probe_state = PROBE_IDLE;
+        endcase
+    end
+
 endmodule
