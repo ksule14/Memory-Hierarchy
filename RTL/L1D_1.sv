@@ -34,10 +34,10 @@ import tilelink_pkg::*;
 
     localparam int L2_SETS     = 8;
     localparam int L2_WAYS     = 2;
-    localparam int OFFSET_BITS = $clog2(LINE_BYTES);
-    localparam int INDEX_BITS  = $clog2(L2_SETS);
-    localparam int TAG_BITS    = ADDR_WIDTH - OFFSET_BITS - INDEX_BITS;
-    localparam int L2_LINE_AW  = $clog2(L2_SETS * L2_WAYS);
+    localparam int OFFSET_BITS = $clog2(LINE_BYTES); // number of bits needed to address each byte in a line
+    localparam int INDEX_BITS  = $clog2(L2_SETS); // number of bits needed to select a set
+    localparam int TAG_BITS    = ADDR_WIDTH - OFFSET_BITS - INDEX_BITS; // remaining bits after offset and index
+    localparam int L2_LINE_AW  = $clog2(L2_SETS * L2_WAYS); // 
     localparam int BEAT_BITS   = $clog2(BEATS);
 
     // cache's fixed TileLink source id
@@ -90,7 +90,10 @@ import tilelink_pkg::*;
     assign last_beat = (beat_count == BEATS-1);
 
     typedef enum logic [1:0] {
-        IDLE, REQUEST, WAIT, ACK
+        IDLE    = 00,
+        REQUEST = 01, 
+        WAIT    = 11, 
+        ACK     = 10
     } miss_t;
 
     miss_t miss_state, next_miss_state;
@@ -240,24 +243,80 @@ import tilelink_pkg::*;
                 chan_e.sink <= saved_sink;
             end
             endcase
+
+            // Channel B-C's permission-downgrade commit lives here rather
+            // than in the probe FSM's own always_ff below, even though
+            // it's that FSM's decision - perms/dirty1 already have this
+            // block as their writer, and a variable can only have one
+            // procedural driver, so a second always_ff writing them (even
+            // at different indices) is a multiple-driver error.
+            if (probe_state == PROBE_SEND && chan_c_valid && chan_c_ready) begin
+                perms[{probe_reg_index, probe_way}] <= probe_new_perm;
+                if (probe_send_data) dirty1[{probe_reg_index, probe_way}] <= 1'b0;
+            end
         end
     end
 
-    // CHANNEL B-C TRANSACTION
+    // CHANNEL B-C TRANSACTION (Probe / ProbeAck(Data))
 
-    // registerd copy of channel b signals
-    logic [OPCODE_WIDTH-1:0]    probe_opcode;
-    logic [PARAM_WIDTH-1:0]     probe_param;
-    logic [SIZE_WIDTH-1:0]      probe_size;
-    logic [SOURCE_WIDTH-1:0]    probe_source;
-    logic [ADDR_WIDTH-1:0]      probe_addr;
-    logic [DATA_WIDTH-1:0]      probe_data;
+    // Decode the incoming probe the same way the main datapath decodes
+    // ins.addr, but off the *live* chan_b bus - chan_b isn't guaranteed to
+    // still be around once we've moved past PROBE_IDLE, which is exactly
+    // why the capture below latches everything derived from it.
+    logic [INDEX_BITS-1:0]  probe_in_index;
+    logic [TAG_BITS-1:0]    probe_in_tag;
+    logic                   probe_in_way; // L2 only ever probes a line we actually hold, so exactly one way matches
+    perm_t                  probe_in_cur_perm, probe_in_cap_level, probe_in_new_perm;
+    logic [PARAM_WIDTH-1:0] probe_in_resp_param;
+
+    assign probe_in_index = chan_b.addr[INDEX_BITS+OFFSET_BITS-1:OFFSET_BITS];
+    assign probe_in_tag   = chan_b.addr[ADDR_WIDTH-1:INDEX_BITS+OFFSET_BITS];
+    assign probe_in_way   = valid1[{probe_in_index, 1'b1}] && (tag1[{probe_in_index, 1'b1}] == probe_in_tag);
+
+    assign probe_in_cur_perm  = perms[{probe_in_index, probe_in_way}];
+    // cap_t's encoding (TO_T=0/TO_B=1/TO_N=2) isn't perm-ordered, so translate
+    // it to a perm_t ceiling before comparing against what we currently hold
+    assign probe_in_cap_level = (chan_b.param == TO_T) ? PERM_T :
+                                 (chan_b.param == TO_B) ? PERM_B : PERM_N;
+    // perm_t is ordered N < B < T numerically, so the resulting permission
+    // is just whichever of the two is smaller
+    assign probe_in_new_perm  = (probe_in_cur_perm < probe_in_cap_level) ? probe_in_cur_perm : probe_in_cap_level;
+
+    always_comb begin
+        if (probe_in_new_perm != probe_in_cur_perm) begin
+            // actually downgrading - report the transition with a shrink_t code
+            case (probe_in_cur_perm)
+                PERM_T:  probe_in_resp_param = (probe_in_new_perm == PERM_B) ? T_TO_B : T_TO_N;
+                default: probe_in_resp_param = B_TO_N; // only B->N can shrink further from here
+            endcase
+        end else begin
+            // already at or below the requested cap - report_t, no real change
+            case (probe_in_cur_perm)
+                PERM_T:  probe_in_resp_param = T_TO_T;
+                PERM_B:  probe_in_resp_param = B_TO_B;
+                default: probe_in_resp_param = N_TO_N;
+            endcase
+        end
+    end
 
     // own beat counter for ProbeAckData because it must not share the miss FSM's
     // beat_count/last_beat, since a probe can be in flight independently of an Acquire
     logic [BEAT_BITS-1:0] probe_beat_count;
     logic                 probe_last_beat;
     assign probe_last_beat = (probe_beat_count == BEATS-1);
+
+    // captured in PROBE_IDLE - safe to latch off chan_b before ready ever
+    // asserts, since valid/ready requires the source to hold chan_b stable
+    // from the moment valid goes high until we accept it in PROBE_RECEIVE
+    logic [ADDR_WIDTH-1:0]  probe_addr;
+    logic                   probe_way;
+    logic                   probe_send_data;   // PROBE_ACK_DATA vs plain PROBE_ACK
+    logic [PARAM_WIDTH-1:0] probe_resp_param;
+    perm_t                  probe_new_perm;
+    logic [SIZE_WIDTH-1:0]  probe_size;
+
+    logic [INDEX_BITS-1:0] probe_reg_index;
+    assign probe_reg_index = probe_addr[INDEX_BITS+OFFSET_BITS-1:OFFSET_BITS];
 
     typedef enum logic [1:0] {
         PROBE_IDLE, PROBE_RECEIVE, PROBE_SEND
@@ -288,19 +347,67 @@ import tilelink_pkg::*;
             end
 
             PROBE_SEND: begin
-              // no neeed for acknowledge state here because channel C is the acknowledgement
-              // There is no channel E equivalent
+                // no need for an ack state here because channel C is itself
+                // the acknowledgement - there's no channel E equivalent.
+                // Only a dirty ProbeBlock's ProbeAckData spans multiple
+                // beats; a plain ProbeAck (clean line, or any ProbePerm)
+                // always leaves after just one.
                 if (chan_c_valid && chan_c_ready) begin
-                    case (probe_opcode)
-                        PROBE_BLOCK: if (probe_last_beat) next_probe_state = PROBE_IDLE;
-                        PROBE_PERM: next_probe_state = PROBE_IDLE;
-                        default: next_probe_state = PROBE_IDLE;
-                    endcase
+                    if (!probe_send_data || probe_last_beat) next_probe_state = PROBE_IDLE;
                 end
             end
 
             default: next_probe_state = PROBE_IDLE;
         endcase
+    end
+
+    // Probe-private datapath - none of these registers are touched by the
+    // miss FSM, so this can safely be its own always_ff. perms/dirty1
+    // themselves are deliberately NOT written here even though this is
+    // where their new values are decided; see the note above the miss FSM's
+    // always_ff for why that write lives there instead.
+    always_ff @(posedge clk) begin
+        if (rst) begin
+            probe_addr       <= '0;
+            probe_way        <= '0;
+            probe_send_data  <= 1'b0;
+            probe_resp_param <= '0;
+            probe_new_perm   <= PERM_N;
+            probe_size       <= '0;
+            probe_beat_count <= '0;
+        end else begin
+            case (probe_state)
+            PROBE_IDLE: begin
+                if (chan_b_valid) begin
+                    probe_addr       <= chan_b.addr;
+                    probe_way        <= probe_in_way;
+                    probe_send_data  <= (chan_b.opcode == PROBE_BLOCK) && dirty1[{probe_in_index, probe_in_way}];
+                    probe_resp_param <= probe_in_resp_param;
+                    probe_new_perm   <= probe_in_new_perm;
+                    probe_size       <= chan_b.size;
+                    probe_beat_count <= '0; // defensive: start PROBE_SEND counting from 0
+                end
+            end
+
+            PROBE_SEND: begin
+                if (chan_c_valid && chan_c_ready) begin
+                    probe_beat_count <= probe_beat_count + 1'b1; // irrelevant once a single-beat ProbeAck has already left PROBE_SEND
+                end
+            end
+            endcase
+        end
+    end
+
+    // Channel C content - combinational off the probe-private registers
+    // above, same idea as outs.rdata reading data1 combinationally
+    always_comb begin
+        chan_c.opcode  = probe_send_data ? PROBE_ACK_DATA : PROBE_ACK;
+        chan_c.param   = probe_resp_param;
+        chan_c.size    = probe_size;
+        chan_c.source  = L1_ID;
+        chan_c.addr    = probe_addr;
+        chan_c.data    = probe_send_data ? data1[{probe_reg_index, probe_way}][probe_beat_count] : '0;
+        chan_c.corrupt = 1'b0;
     end
 
 endmodule
