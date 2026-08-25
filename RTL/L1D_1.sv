@@ -136,7 +136,7 @@ import tilelink_pkg::*;
 
     // valid/ready for the channels miss FSM drives
     assign chan_a_valid = (miss_state == REQUEST); // when channel A ACQUIRE is sent to L2
-    assign chan_d_ready = (miss_state == WAIT) || (miss_state == RELEASE_WAIT); // WAIT: GRANT/GRANTDATA, RELEASE_WAIT: RELEASE_ACK
+    assign chan_d_ready = 'd1; // always high to avoid deadlock with this L1 and L2 due to another acquire
     assign chan_e_valid = (miss_state == ACK); // when E responds with sink
 
     // ------------------------------------------------------------------
@@ -374,7 +374,7 @@ import tilelink_pkg::*;
 
     // ready/valid for the channels this FSM drives, based on probe_state
     // same pattern as chan_a_valid/chan_d_ready/chan_e_valid
-    assign chan_b_ready = (probe_state == PROBE_RECEIVE);
+    assign chan_b_ready = 'd1; // always high to avoid deadlock with two L1s.
 
     // Channel C now has two logical sources. This probe FSM and the miss
     // FSM's EVICT state (voluntary Release/ReleaseData). Both are funneled
