@@ -53,10 +53,16 @@ import tilelink_pkg::*;
     // start arriving several cycles later
     logic [ADDR_WIDTH-1:0]  saved_addr;
     logic                   saved_way;
-    logic [PARAM_WIDTH-1:0] saved_perm;   
+    logic [PARAM_WIDTH-1:0] saved_perm;
     logic [SINK_WIDTH-1:0]  saved_sink;   // bookmark sent by D for D-E transaction. Echoed back on Channel E to close the transaction
     logic [BEAT_BITS-1:0]   beat_count;
     logic                   last_beat;
+
+    // victim line's state, latched alongside saved_addr/saved_way at miss
+    // detection. decides Release vs ReleaseData and the shrink_t param
+    // for the voluntary eviction if one is needed
+    logic                   saved_evict_dirty;
+    logic [PARAM_WIDTH-1:0] saved_evict_param;
 
     logic [OFFSET_BITS-1:0] offset; // selects beat (and byte but we don't use that)
     logic [INDEX_BITS-1:0]  index; // selects set
@@ -88,12 +94,17 @@ import tilelink_pkg::*;
 
     assign last_beat = (beat_count == BEATS-1);
 
-    // states for cache miss FSM
-    typedef enum logic [1:0] {
-        IDLE    = 00,
-        REQUEST = 01, 
-        WAIT    = 11, 
-        ACK     = 10
+    // states for cache miss FSM. EVICT/RELEASE_WAIT only run ahead of
+    // REQUEST when the fill has to replace an already-valid line; a
+    // same-line permission upgrade (tag_hit but !perm_ok) skips straight
+    // to REQUEST since there's nothing to write back.
+    typedef enum logic [2:0] {
+        IDLE,
+        EVICT,
+        RELEASE_WAIT,
+        REQUEST,
+        WAIT,
+        ACK
     } miss_t;
 
     miss_t miss_state, next_miss_state;
@@ -125,7 +136,7 @@ import tilelink_pkg::*;
 
     // valid/ready for the channels miss FSM drives
     assign chan_a_valid = (miss_state == REQUEST); // when channel A ACQUIRE is sent to L2
-    assign chan_d_ready = (miss_state == WAIT); // when D sends GRANT/GRANTDATA
+    assign chan_d_ready = (miss_state == WAIT) || (miss_state == RELEASE_WAIT); // WAIT: GRANT/GRANTDATA, RELEASE_WAIT: RELEASE_ACK
     assign chan_e_valid = (miss_state == ACK); // when E responds with sink
 
     // ------------------------------------------------------------------
@@ -135,7 +146,27 @@ import tilelink_pkg::*;
         next_miss_state = miss_state;
         case (miss_state)
             IDLE: begin
-                if (!hit) next_miss_state = REQUEST; // miss this cycle, request gets latched below
+                if (!hit) begin
+                    // a true miss (!tag_hit) reuses way0's slot - if that
+                    // slot already holds a valid line we have to write it
+                    // back first. A permission-only upgrade (tag_hit) never
+                    // evicts anything.
+                    if (!tag_hit && valid1[{index, hit_way}]) next_miss_state = EVICT;
+                    else next_miss_state = REQUEST;
+                end
+            end
+
+            EVICT: begin
+                // Channel C is arbitrated below (probe FSM wins ties); only
+                // count this as accepted if our Release/ReleaseData actually
+                // won the bus this cycle
+                if (!probe_c_req && chan_c_ready) begin
+                    if (!saved_evict_dirty || last_beat) next_miss_state = RELEASE_WAIT;
+                end
+            end
+
+            RELEASE_WAIT: begin
+                if (chan_d_valid && chan_d_ready && chan_d.opcode == RELEASE_ACK) next_miss_state = REQUEST;
             end
 
             REQUEST: begin
@@ -172,6 +203,8 @@ import tilelink_pkg::*;
             saved_perm <= '0;
             saved_sink <= '0;
             beat_count <= '0;
+            saved_evict_dirty <= '0;
+            saved_evict_param <= '0;
             chan_a     <= '0;
             chan_e     <= '0;
             for (int i = 0; i < L2_SETS*L2_WAYS; i++) valid1[i] <= 1'b0; // avoid X-valued lines looking like hits
@@ -184,11 +217,18 @@ import tilelink_pkg::*;
                     // once transaction several cycles into WAIT
                     saved_addr <= ins.addr;
                     saved_way  <= hit_way; // on miss it fills way0
+                    beat_count <= '0; // fresh count for whichever of EVICT/WAIT reads it next
+
+                    // only meaningful when EVICT is actually entered
+                    // (next_miss_state above); captured unconditionally
+                    // since it's cheap and harmless otherwise
+                    saved_evict_dirty <= dirty1[{index, hit_way}];
+                    saved_evict_param <= (perms[{index, hit_way}] == PERM_T) ? T_TO_N : B_TO_N;
 
                     chan_a.size    <= SIZE_WIDTH'($clog2(LINE_BYTES));
                     chan_a.source  <= L1_ID;
                     chan_a.addr    <= ins.addr;
-                    chan_a.mask    <= '0; // whole-line transfers only, never a partial write mask
+                    chan_a.mask    <= '0; // whole line transfers only, never a partial write mask
                     chan_a.data    <= '0; // Acquire carries no data - it comes back on GrantDATA
                     chan_a.corrupt <= '0;
 
@@ -208,6 +248,12 @@ import tilelink_pkg::*;
                 end
             end
 
+            EVICT: begin
+                if (!probe_c_req && chan_c_ready) begin
+                    beat_count <= beat_count + 1'b1; // counts ReleaseData beats; harmless no-op path for a single-beat Release
+                end
+            end
+
             REQUEST: begin
                 beat_count <= '0; // ensures counting in WAIT starts at 0
             end
@@ -220,19 +266,18 @@ import tilelink_pkg::*;
                     saved_sink <= chan_d.sink;
 
                     if (chan_d.opcode == GRANT_DATA) begin
-                        data1[{index, saved_way}][beat_count] <= chan_d.data;
+                        data1[{index, saved_way}][beat_count] <= chan_d.data; // assign each beat to data1
                         beat_count <= beat_count + 1'b1; // wraps back to 0 on the last beat (BEAT_BITS-wide)
                     end
                 end
             end
 
             ACK: begin
-                // commit the fill/upgrade while we hold GrantAck valid -
-                // idempotent, so it's fine to re-drive every cycle we sit here
+                // commit the fill/upgrade while we hold GrantAck valid
                 tag1[{index, saved_way}]   <= saved_addr[ADDR_WIDTH-1:INDEX_BITS+OFFSET_BITS];
                 valid1[{index, saved_way}] <= 1'b1;
-                dirty1[{index, saved_way}] <= 1'b0; // freshly filled/upgraded line is clean
-                case (saved_perm)
+                dirty1[{index, saved_way}] <= 1'b0; // freshly filled line is clean
+                case (saved_perm) // assign whatever permission it was assigned from chan D
                     TO_T:    perms[{index, saved_way}] <= PERM_T;
                     TO_B:    perms[{index, saved_way}] <= PERM_B;
                     TO_N:    perms[{index, saved_way}] <= PERM_N;
@@ -245,10 +290,10 @@ import tilelink_pkg::*;
 
             // Channel B-C's permission-downgrade commit lives here rather
             // than in the probe FSM's own always_ff below, even though
-            // it's that FSM's decision - perms/dirty1 already have this
+            // it's that FSM's decision. perms/dirty1 already have this
             // block as their writer, and a variable can only have one
-            // procedural driver, so a second always_ff writing them (even
-            // at different indices) is a multiple-driver error.
+            // procedural driver, so a second always_ff writing them
+            // is a multiple-driver error.
             if (probe_state == PROBE_SEND && chan_c_valid && chan_c_ready) begin
                 perms[{probe_reg_index, probe_way}] <= probe_new_perm;
                 if (probe_send_data) dirty1[{probe_reg_index, probe_way}] <= 1'b0;
@@ -259,40 +304,42 @@ import tilelink_pkg::*;
     // CHANNEL B-C TRANSACTION (Probe / ProbeAck(Data))
 
     // Decode the incoming probe the same way the main datapath decodes
-    // ins.addr, but off the *live* chan_b bus - chan_b isn't guaranteed to
-    // still be around once we've moved past PROBE_IDLE, which is exactly
-    // why the capture below latches everything derived from it.
+    // ins.addr, but off the live chan_b bus. chan_b isn't guaranteed to
+    // still be around after PROBE_IDLE, which is why we capture the data now
     logic [INDEX_BITS-1:0]  probe_in_index;
     logic [TAG_BITS-1:0]    probe_in_tag;
     logic                   probe_in_way; // L2 only ever probes a line we actually hold, so exactly one way matches
     perm_t                  probe_in_cur_perm, probe_in_cap_level, probe_in_new_perm;
     logic [PARAM_WIDTH-1:0] probe_in_resp_param;
 
-    assign probe_in_index = chan_b.addr[INDEX_BITS+OFFSET_BITS-1:OFFSET_BITS];
-    assign probe_in_tag   = chan_b.addr[ADDR_WIDTH-1:INDEX_BITS+OFFSET_BITS];
-    assign probe_in_way   = valid1[{probe_in_index, 1'b1}] && (tag1[{probe_in_index, 1'b1}] == probe_in_tag);
+    assign probe_in_index = chan_b.addr[INDEX_BITS+OFFSET_BITS-1:OFFSET_BITS]; // index of address to be probed, used to find matching way
+    assign probe_in_tag   = chan_b.addr[ADDR_WIDTH-1:INDEX_BITS+OFFSET_BITS]; // tag of address to be probed
+    assign probe_in_way   = valid1[{probe_in_index, 1'b1}] && (tag1[{probe_in_index, 1'b1}] == probe_in_tag); // if true probe_way = 1, if false probe_way = 0
 
-    assign probe_in_cur_perm  = perms[{probe_in_index, probe_in_way}];
+    assign probe_in_cur_perm  = perms[{probe_in_index, probe_in_way}]; // current permission state of address
     // cap_t's encoding (TO_T=0/TO_B=1/TO_N=2) isn't perm-ordered, so translate
     // it to a perm_t ceiling before comparing against what we currently hold
     assign probe_in_cap_level = (chan_b.param == TO_T) ? PERM_T :
-                                 (chan_b.param == TO_B) ? PERM_B : PERM_N;
+                                 (chan_b.param == TO_B) ? PERM_B : PERM_N; // assign a permission from chan_b cap_t
     // perm_t is ordered N < B < T numerically, so the resulting permission
-    // is just whichever of the two is smaller
+    // is the smaller permission between current perm and cap perm
     assign probe_in_new_perm  = (probe_in_cur_perm < probe_in_cap_level) ? probe_in_cur_perm : probe_in_cap_level;
 
+    // code for response param on channel C
     always_comb begin
         if (probe_in_new_perm != probe_in_cur_perm) begin
-            // actually downgrading - report the transition with a shrink_t code
+            // actually downgrading, report transition with a shrink_t code
             case (probe_in_cur_perm)
-                PERM_T:  probe_in_resp_param = (probe_in_new_perm == PERM_B) ? T_TO_B : T_TO_N;
-                default: probe_in_resp_param = B_TO_N; // only B->N can shrink further from here
+                PERM_T: probe_in_resp_param = (probe_in_new_perm == PERM_B) ? T_TO_B : T_TO_N;
+                PERM_B: probe_in_resp_param = B_TO_N;
+                default: probe_in_resp_param = B_TO_N;
             endcase
         end else begin
-            // already at or below the requested cap - report_t, no real change
+            // already at or below the requested cap report_t, no real change
             case (probe_in_cur_perm)
-                PERM_T:  probe_in_resp_param = T_TO_T;
-                PERM_B:  probe_in_resp_param = B_TO_B;
+                PERM_T: probe_in_resp_param = T_TO_T;
+                PERM_B: probe_in_resp_param = B_TO_B;
+                PERM_N: probe_in_resp_param = N_TO_N;
                 default: probe_in_resp_param = N_TO_N;
             endcase
         end
@@ -304,7 +351,7 @@ import tilelink_pkg::*;
     logic                 probe_last_beat;
     assign probe_last_beat = (probe_beat_count == BEATS-1);
 
-    // captured in PROBE_IDLE - safe to latch off chan_b before ready ever
+    // captured in PROBE_IDLE, safe to latch off chan_b before ready ever
     // asserts, since valid/ready requires the source to hold chan_b stable
     // from the moment valid goes high until we accept it in PROBE_RECEIVE
     logic [ADDR_WIDTH-1:0]  probe_addr;
@@ -315,8 +362,9 @@ import tilelink_pkg::*;
     logic [SIZE_WIDTH-1:0]  probe_size;
 
     logic [INDEX_BITS-1:0] probe_reg_index;
-    assign probe_reg_index = probe_addr[INDEX_BITS+OFFSET_BITS-1:OFFSET_BITS];
+    assign probe_reg_index = probe_addr[INDEX_BITS+OFFSET_BITS-1:OFFSET_BITS]; // used to store permission change
 
+    // FSM for Channel B-C transaction
     typedef enum logic [1:0] {
         PROBE_IDLE, PROBE_RECEIVE, PROBE_SEND
     } b_probe_t;
@@ -324,10 +372,20 @@ import tilelink_pkg::*;
     b_probe_t probe_state;
     b_probe_t next_probe_state;
 
-    // ready/valid for the channels this FSM drives, straight off the state -
-    // same pattern as chan_a_valid/chan_d_ready/chan_e_valid above
+    // ready/valid for the channels this FSM drives, based on probe_state
+    // same pattern as chan_a_valid/chan_d_ready/chan_e_valid
     assign chan_b_ready = (probe_state == PROBE_RECEIVE);
-    assign chan_c_valid = (probe_state == PROBE_SEND);
+
+    // Channel C now has two logical sources. This probe FSM and the miss
+    // FSM's EVICT state (voluntary Release/ReleaseData). Both are funneled
+    // through this one arbitrated assign so chan_c/chan_c_valid still only
+    // has a single driver. Fixed "probe always wins" priority is a
+    // placeholder; I am adding a real priority encoder for
+    // cross-channel contention later.
+    logic probe_c_req, evict_c_req;
+    assign probe_c_req  = (probe_state == PROBE_SEND);
+    assign evict_c_req  = (miss_state == EVICT);
+    assign chan_c_valid = probe_c_req || evict_c_req;
 
     always_ff @(posedge clk) begin
         if (rst) probe_state <= PROBE_IDLE;
@@ -338,16 +396,16 @@ import tilelink_pkg::*;
         next_probe_state = probe_state;
         case (probe_state)
             PROBE_IDLE: begin
-                if (chan_b_valid) next_probe_state = PROBE_RECEIVE;
+                if (chan_b_valid) next_probe_state = PROBE_RECEIVE; // proceed if channel b wants to initiate transaction
             end
 
             PROBE_RECEIVE: begin
-                if (chan_b_valid && chan_b_ready) next_probe_state = PROBE_SEND;
+                if (chan_b_valid && chan_b_ready) next_probe_state = PROBE_SEND; // proceed to receive the data if L1 is ready for it
             end
 
             PROBE_SEND: begin
                 // no need for an ack state here because channel C is itself
-                // the acknowledgement - there's no channel E equivalent.
+                // the acknowledgement so there's no channel E equivalent.
                 // Only a dirty ProbeBlock's ProbeAckData spans multiple
                 // beats; a plain ProbeAck (clean line, or any ProbePerm)
                 // always leaves after just one.
@@ -360,11 +418,10 @@ import tilelink_pkg::*;
         endcase
     end
 
-    // Probe-private datapath - none of these registers are touched by the
+    // Probe-private datapath. none of these registers are touched by the
     // miss FSM, so this can safely be its own always_ff. perms/dirty1
     // themselves are deliberately NOT written here even though this is
-    // where their new values are decided; see the note above the miss FSM's
-    // always_ff for why that write lives there instead.
+    // where their new values are decided. Did this to avoid multiple drivers error.
     always_ff @(posedge clk) begin
         if (rst) begin
             probe_addr       <= '0;
@@ -377,14 +434,14 @@ import tilelink_pkg::*;
         end else begin
             case (probe_state)
             PROBE_IDLE: begin
-                if (chan_b_valid) begin
+                if (chan_b_valid) begin // capture everything when data is valid
                     probe_addr       <= chan_b.addr;
                     probe_way        <= probe_in_way;
                     probe_send_data  <= (chan_b.opcode == PROBE_BLOCK) && dirty1[{probe_in_index, probe_in_way}];
                     probe_resp_param <= probe_in_resp_param;
                     probe_new_perm   <= probe_in_new_perm;
                     probe_size       <= chan_b.size;
-                    probe_beat_count <= '0; // defensive: start PROBE_SEND counting from 0
+                    probe_beat_count <= '0; // defensive, start PROBE_SEND counting from 0
                 end
             end
 
@@ -397,16 +454,29 @@ import tilelink_pkg::*;
         end
     end
 
-    // Channel C content - combinational off the probe-private registers
-    // above, same idea as outs.rdata reading data1 combinationally
+    // Channel C content. same "probe wins" priority as chan_c_valid above
     always_comb begin
-        chan_c.opcode  = probe_send_data ? PROBE_ACK_DATA : PROBE_ACK;
-        chan_c.param   = probe_resp_param;
-        chan_c.size    = probe_size;
-        chan_c.source  = L1_ID;
-        chan_c.addr    = probe_addr;
-        chan_c.data    = probe_send_data ? data1[{probe_reg_index, probe_way}][probe_beat_count] : '0;
-        chan_c.corrupt = 1'b0;
+        if (probe_c_req) begin
+            chan_c.opcode  = probe_send_data ? PROBE_ACK_DATA : PROBE_ACK;
+            chan_c.param   = probe_resp_param;
+            chan_c.size    = probe_size;
+            chan_c.source  = L1_ID;
+            chan_c.addr    = probe_addr;
+            chan_c.data    = probe_send_data ? data1[{probe_reg_index, probe_way}][probe_beat_count] : '0;
+            chan_c.corrupt = 1'b0;
+        end else begin
+            // evict_c_req. voluntary write-back of the line the incoming
+            // miss is about to replace. saved_way/index still point at the
+            // victim's slot; the new line's tag/valid/perm/dirty are only
+            // committed later, in the miss FSM's ACK state.
+            chan_c.opcode  = saved_evict_dirty ? RELEASE_DATA : RELEASE;
+            chan_c.param   = saved_evict_param;
+            chan_c.size    = SIZE_WIDTH'($clog2(LINE_BYTES));
+            chan_c.source  = L1_ID;
+            chan_c.addr    = saved_addr;
+            chan_c.data    = saved_evict_dirty ? data1[{index, saved_way}][beat_count] : '0;
+            chan_c.corrupt = 1'b0;
+        end
     end
 
 endmodule
