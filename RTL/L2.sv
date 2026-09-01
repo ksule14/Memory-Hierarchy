@@ -54,16 +54,16 @@ module l2_cache
     logic                valid_array [0:L2_SETS*L2_WAYS-1];
     logic                dirty_array [0:L2_SETS*L2_WAYS-1];
 
-    typedef enum logic [3:0] {  
-        IDLE       = 4'd0,
-        MM_READ    = 4'd1,
-        MM_RESPOND = 4'd2,
-        MM_WRITE   = 4'd3,
-        MM_ACK     = 4'd4,      
-        L2_READ    = 4'd5,
-        L2_RESPOND = 4'd6,
-        L2_WRITE   = 4'd7,
-        L2_ACK     = 4'd8
+    typedef enum logic [3:0] {
+        IDLE       = 4'b0000,
+        MM_READ    = 4'b0001,
+        MM_RESPOND = 4'b0011,
+        MM_WRITE   = 4'b0010,
+        MM_ACK     = 4'b0110,
+        L2_READ    = 4'b0111,
+        L2_RESPOND = 4'b0101,
+        L2_WRITE   = 4'b0100,
+        L2_ACK     = 4'b1100
     } to_mem_state_t;
 
     to_mem_state_t state, next_state;

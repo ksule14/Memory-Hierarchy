@@ -27,11 +27,11 @@ module main_memory
 
     // states that main memory can be in
     typedef enum logic [2:0] {
-        IDLE    = 3'd0,
-        READ    = 3'd1,
-        RESPOND = 3'd2,
-        WRITE   = 3'd3,
-        ACK     = 3'd4
+        IDLE    = 3'b000,
+        READ    = 3'b001,
+        RESPOND = 3'b011,
+        WRITE   = 3'b010,
+        ACK     = 3'b110
     } state_t;
 
     state_t state, next_state;

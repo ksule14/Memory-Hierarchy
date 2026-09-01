@@ -32,21 +32,21 @@ import tilelink_pkg::*;
     input  logic     chan_e_ready
 );
 
-    localparam int L2_SETS     = 8;
-    localparam int L2_WAYS     = 2;
+    localparam int L1_SETS     = 8;
+    localparam int L1_WAYS     = 2;
     localparam int OFFSET_BITS = $clog2(LINE_BYTES); // number of bits needed to address each byte in a line
-    localparam int INDEX_BITS  = $clog2(L2_SETS); // number of bits needed to select a set
+    localparam int INDEX_BITS  = $clog2(L1_SETS); // number of bits needed to select a set
     localparam int TAG_BITS    = ADDR_WIDTH - OFFSET_BITS - INDEX_BITS; // remaining bits after offset and index
     localparam int BEAT_BITS   = $clog2(BEATS); // number of bits to represent the number of beats on a data transfer
 
     // cache's fixed TileLink source id
     localparam logic [SOURCE_WIDTH-1:0] L1_ID = 2'd1;
 
-    logic [DATA_WIDTH-1:0] data1  [0:L2_SETS*L2_WAYS-1][0:BEATS-1]; // cache that is 4*DATA_WIDTH wide (16 bytes wide) and 16 rows deep
-    logic [TAG_BITS-1:0]   tag1   [0:L2_SETS*L2_WAYS-1]; // tag cache for each row
-    logic                  valid1 [0:L2_SETS*L2_WAYS-1]; // valid cache for each row (16 entries)
-    logic                  dirty1 [0:L2_SETS*L2_WAYS-1]; // dirty cache for each row (16 entries)
-    perm_t                 perms  [0:L2_SETS*L2_WAYS-1]; // permission cache for each row (16 entries)
+    logic [DATA_WIDTH-1:0] data1  [0:L1_SETS*L1_WAYS-1][0:BEATS-1]; // cache that is 4*DATA_WIDTH wide (16 bytes wide) and 16 rows deep
+    logic [TAG_BITS-1:0]   tag1   [0:L1_SETS*L1_WAYS-1]; // tag cache for each row
+    logic                  valid1 [0:L1_SETS*L1_WAYS-1]; // valid cache for each row (16 entries)
+    logic                  dirty1 [0:L1_SETS*L1_WAYS-1]; // dirty cache for each row (16 entries)
+    perm_t                 perms  [0:L1_SETS*L1_WAYS-1]; // permission cache for each row (16 entries)
 
     // captured when a miss is first detected in IDLE, since ins.something/
     // the tag-hit way aren't guaranteed to still line up once beats
@@ -99,12 +99,12 @@ import tilelink_pkg::*;
     // same-line permission upgrade (tag_hit but !perm_ok) skips straight
     // to REQUEST since there's nothing to write back.
     typedef enum logic [2:0] {
-        IDLE,
-        EVICT,
-        RELEASE_WAIT,
-        REQUEST,
-        WAIT,
-        ACK
+        IDLE         = 3'b000,
+        EVICT        = 3'b001,
+        RELEASE_WAIT = 3'b011,
+        REQUEST      = 3'b010,
+        WAIT         = 3'b110,
+        ACK          = 3'b111
     } miss_t;
 
     miss_t miss_state, next_miss_state;
@@ -207,7 +207,7 @@ import tilelink_pkg::*;
             saved_evict_param <= '0;
             chan_a     <= '0;
             chan_e     <= '0;
-            for (int i = 0; i < L2_SETS*L2_WAYS; i++) valid1[i] <= 1'b0; // avoid X-valued lines looking like hits
+            for (int i = 0; i < L1_SETS*L1_WAYS; i++) valid1[i] <= 1'b0; // avoid X-valued lines looking like hits
         end else begin
             case (miss_state)
             IDLE: begin
@@ -366,7 +366,9 @@ import tilelink_pkg::*;
 
     // FSM for Channel B-C transaction
     typedef enum logic [1:0] {
-        PROBE_IDLE, PROBE_RECEIVE, PROBE_SEND
+        PROBE_IDLE    = 2'b00,
+        PROBE_RECEIVE = 2'b01,
+        PROBE_SEND    = 2'b11
     } b_probe_t;
 
     b_probe_t probe_state;
@@ -383,8 +385,8 @@ import tilelink_pkg::*;
     // placeholder; I am adding a real priority encoder for
     // cross-channel contention later.
     logic probe_c_req, evict_c_req;
-    assign probe_c_req  = (probe_state == PROBE_SEND);
-    assign evict_c_req  = (miss_state == EVICT);
+    assign probe_c_req  = (probe_state == PROBE_SEND); // channel C is actively responding to probe
+    assign evict_c_req  = (miss_state == EVICT); // channel C is actively releasing
     assign chan_c_valid = probe_c_req || evict_c_req;
 
     always_ff @(posedge clk) begin
