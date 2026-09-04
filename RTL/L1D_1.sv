@@ -147,7 +147,7 @@ import tilelink_pkg::*;
         case (miss_state)
             IDLE: begin
                 if (!hit) begin
-                    // a true miss (!tag_hit) reuses way0's slot - if that
+                    // a true miss (!tag_hit) reuses way0's slot. if that
                     // slot already holds a valid line we have to write it
                     // back first. A permission-only upgrade (tag_hit) never
                     // evicts anything.
@@ -166,7 +166,7 @@ import tilelink_pkg::*;
             end
 
             RELEASE_WAIT: begin
-                if (chan_d_valid && chan_d_ready && chan_d.opcode == RELEASE_ACK) next_miss_state = REQUEST;
+                if (chan_d_valid && chan_d_ready && (chan_d.opcode == RELEASE_ACK)) next_miss_state = REQUEST;
             end
 
             REQUEST: begin
@@ -229,7 +229,7 @@ import tilelink_pkg::*;
                     chan_a.source  <= L1_ID;
                     chan_a.addr    <= ins.addr;
                     chan_a.mask    <= '0; // whole line transfers only, never a partial write mask
-                    chan_a.data    <= '0; // Acquire carries no data - it comes back on GrantDATA
+                    chan_a.data    <= '0; // Acquire carries no data, it comes back on GrantDATA
                     chan_a.corrupt <= '0;
 
                     if (tag_hit) begin
