@@ -282,7 +282,62 @@ import tilelink_pkg::*;
             end
             endcase
 
-            
+            // Channel B-C's permission-downgrade commit lives here rather
+            // than in the probe FSM's own always_ff below, even though
+            // it's that FSM's decision. perms/dirty1 already have this
+            // block as their writer, and a variable can only have one
+            // procedural driver, so a second always_ff writing them
+            // is a multiple-driver error.
+
+            if (probe_state == PROBE_SEND && chan_c_valid && chan_c_ready) begin
+                perms2[{probe_reg_index, probe_way}] <= probe_new_perm;
+                if (probe_send_data) dirty2[{probe_reg_index, probe_way}] <= 1'b0;
+            end
+        end
+    end
+
+    // CHANNEL B-C TRANSACTION (Probe / ProbeAck)
+
+    // Decode the incoming probe the same way the main datapath decodes
+    // ins.addr, but off the live chan_b bus. Chan_b isn't guaranteed to 
+    // still be around after PROBE_IDLE, which is why we capture the data now
+    logic [INDEX_BITS-1:0]  probe_in_index;
+    logic [TAG_BITS-1:0]    probe_in_tag;
+    logic                   probe_in_way; // L2 only ever probes a line we actually hold, so exactly one way matches
+    perm_t                  probe_in_cur_perm, probe_in_cap_level, probe_in_new_perm;
+    logic [PARAM_WIDTH-1:0] probe_in_resp_param;
+
+    assign probe_in_index = chan_b.addr[INDEX_BITS+OFFSET_BITS-1:OFFSET_BITS]; // index of address to be probed, used to find matching way
+    assign probe_in_tag   = chan_b.addr[ADDR_WIDTH-1:INDEX_BITS+OFFSET_BITS]; // tag of address to be probed
+    assign probe_in_way   = valid2[{probe_in_index, 1'b1}] && (tag2[{probe_in_index, 1'b1}] == probe_in_tag); // if true probe_way = 1, if false = 0
+
+    assign probe_in_cur_perm = perms2[{probe_in_index, probe_in_way}]; // current permission state of address
+    // cap_t's encoding (TO_T=0/TO_B=1/TO_N=2) isn't perm-ordered, so we translate 
+    // it to a perm_t ceiling before comparing against what we currently hold
+    assign probe_in_cap_level = (chan_b.param == TO_T) ? PERM_T :
+                                 (chan_b.param == TO_B) ? PERM_B : PERM_N;
+    
+    assign prove_in_new_perm = (probe_in_cur_perm < probe_in_cap_level) ? probe_in_cur_perm : probe_in_cap_level;
+
+    // code for response param on channel C
+    always_comb begin
+        if (probe_in_new_perm != probe_in_cur_perm) begin
+            // actually downgrading, report transition with a shrink_t code
+            case (probe_in_cur_perm)
+                PERM_T: probe_in_resp_param = (probe_in_new_perm == PERM_B) ? T_TO_B : T_TO_N;
+                PERM_B: probe_in_resp_param = B_TO_N;
+                default: probe_in_resp_param = B_TO_N;
+            endcase
+        end else begin
+            // already at or below the requested cap report_t, no change
+            case(prob_in_cur_perm)
+                PERM_T: probe_in_resp_param = T_TO_T;
+                PERM_B: probe_in_resp_param = T_TO_B;
+                PERM_N: probe_in_resp_param = T_TO_N;
+                default: probe_in_resp_param = T_TO_N;
+            endcase
+        end
+    end
 
 
 
