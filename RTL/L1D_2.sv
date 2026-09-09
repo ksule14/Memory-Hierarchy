@@ -339,5 +339,133 @@ import tilelink_pkg::*;
         end
     end
 
+    // own beat counter for ProbeAckData because it must not share the miss FSM's
+    // beat_count/last_beat, since a probe can be in flight independently of an Acquire
+    logic [BEAT_BITS-1:0] probe_beat_count;
+    logic                 probe_last_beat;
+    assign probe_last_beat = (probe_beat_count == BEATS-1);
+
+    //captured in PROBE_IDLE, safe to latch off chan_b before ready ever asserts,
+    // since valid/ ready requires the source to hold chan_b stable
+    // from the moment valid goes high until we accept it in PROBE_RECEIVE
+    logic [ADDR_WIDTH-1:0]  probe_addr;
+    logic                   probe_way;
+    logic                   probe_send_data; // PROBE_ACK_DATA vs PROBE_ACK
+    logic [PARAM_WIDTH-1:0] probe_resp_param;
+    perm_t                  probe_new_perm;
+    logic [SIZE_WIDTH-1:0]  probe_size;
+
+    logic [INDEX_WIDTH-1:0] probe_reg_index;
+    assign probe_reg_index = probe_addr[INDEX_BITS+OFFSET_BITS-1:OFFSET_BITS]; // used to store permission change
+
+    // FSM for channel B-C transaction
+    typedef enum logic {
+        PROBE_IDLE = 1'b0,
+        PROBE_SEND = 1'b1
+    } b_probe_t;
+
+    b_probe_t probe_state, next_probe_state;
+
+    // ready/valid for the channels this FSM drives, based on probe_state
+    // same pattern as chan_a_valid/chan_d_ready/chan_e_valid
+    assign chan_b_ready = 'b1; // always high to avoid deadlock with 2 L1s
+
+    // Channel C now has two logic sources. This probe FSM and the miss FSM's EVICT
+    // state (voluntary Release/ReleaseData). Both are funneled through this one arbitrated
+    // assign so chan_c/chan_valid still only has a single driver. Probe has priority
+    // over miss to avoid deadlock
+
+    logic probe_c_req, evict_c_req;
+    assign probe_c_req  = (probe_state == PROBE_SEND); // channel C is actively responding to probe
+    assign evict_c_req  = (miss_state == EVICT); // channel C is actively releasing
+    assign chan_c_valid = probe_c_req || evict_c_req;
+
+    always_ff @(posedge clk) begin
+        if (rst) probe_state <= PROBE_IDLE;
+        else probe_state <= next_probe_state;
+    end
+
+    always_comb begin
+        next_probe_state = probe_state;
+        case (probe_state)
+            PROBE_IDLE: begin
+                if (chan_b_valid) next_probe_state = PROBE_SEND; // proceed if chan b wants to initiate transaction
+            end
+
+            PROBE_SEND: begin
+                // no need for an ack state here because channel C is the terminal message
+                // There is no channel E equivalent.
+                // dirty ProbeBlock's ProbeAckData spans multiple beats
+                // ProbeAck(clean line, or any ProbePerm) ends after one beat
+                if (chan_c_valid && chan_c_ready) begin
+                    if (!probe_send_data || probe_last_beat) next_probe_state = PROBE_IDLE;
+                end
+            end
+
+            default: next_probe_state = PROBE_IDLE;
+        endcase
+    end
+
+    // Probe-private datapath. none of these registers are touched by the 
+    // miss FSM, so this can safely be its own always_ff. perms/dirty
+    // are deliberately not written here even though this is where their new values
+    // are decided. Did this to avoid multiple drivers error.
+    always_ff @(posedge clk) begin
+        if (rst) begin
+            probe_addr       <= '0;
+            probe_way        <= '0;
+            probe_send_data  <= '0;
+            probe_resp_param <= '0;
+            probe_new_param  <= '0;
+            probe_size       <= '0;
+            probe_beat_count <= '0;
+        end else begin
+            case (probe_state)
+                PROBE_IDLE: begin
+                    if (chan_b_valid) begin //capture everything when the data is valid
+                        probe_addr       <= chan_b.addr;
+                        probe_way        <= probe_in_way;
+                        probe_send_data  <= (chan_b.opcode == PROBE_BLOCK) && dirty2[{probe_in_index, probe_in_way}];
+                        probe_resp_param <= probe_in_resp_param;
+                        probe_new_param  <= probe_in_new_perm
+                        probe_size       <= chan_b.size;
+                        probe_beat_count <= '0; // defense, start PROBE_SEND counting from 0
+                    end
+                end
+                
+                PROBE_SEND: begin
+                    if (chan_c_valid && chan_c_ready) begin
+                        probe_beat_count <= probe_beat_count + 1'b1;
+                    end
+                end
+            endcase
+        end
+    end
+
+    // Channel C content. same probe wins priority as chan_C_valid above
+    always_comb begin
+        if (probe_c_req) begin
+            chan_c.opcode = probe_send_data ? PROBE_ACK_DATA : PROBE_ACK;
+            chan_c.param = probe_resp_param;
+            chan_c.size = probe_size;
+            chan_c.source = L1_ID;
+            chan_c.addr = probe_addr;
+            chan_c.data = probe_send_data ? data2[{probe_reg_index, probe_way}][probe_beat_count] : '0;
+            chan_c.corrupt = '0;
+        end else begin
+            // evict_c_req. Voluntary write back of the line the incoming miss is about to replace
+            // saved_way/index still point at the victim's slot. The new line's tag/valid/perm/dirty
+            // are only committed later, in the miss FSM's ACK state
+            chan_c.opcode  = saved_evict_dirty ? RELEASE_DATA : RELEASE;
+            chan_c.param   = saved_evict_param;
+            chan_c.size    = SIZE_WIDTH'($clog2(LINE_BYTES));
+            chan_c.source  = L1_ID;
+            chan_c.addr    = saved_addr;
+            chan_c.data    = saved_evict_dirty ? data2[{index, saved_way}][beat_count] : '0;
+            chan_c.corrupt = '0;
+        end
+    end
+endmodule
+                
 
 

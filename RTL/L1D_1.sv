@@ -365,10 +365,9 @@ import tilelink_pkg::*;
     assign probe_reg_index = probe_addr[INDEX_BITS+OFFSET_BITS-1:OFFSET_BITS]; // used to store permission change
 
     // FSM for Channel B-C transaction
-    typedef enum logic [1:0] {
-        PROBE_IDLE    = 2'b00,
-        PROBE_RECEIVE = 2'b01,
-        PROBE_SEND    = 2'b11
+    typedef enum logic {
+        PROBE_IDLE = 1'b0,
+        PROBE_SEND = 1'b1
     } b_probe_t;
 
     b_probe_t probe_state;
@@ -376,14 +375,12 @@ import tilelink_pkg::*;
 
     // ready/valid for the channels this FSM drives, based on probe_state
     // same pattern as chan_a_valid/chan_d_ready/chan_e_valid
-    assign chan_b_ready = 'd1; // always high to avoid deadlock with two L1s.
+    assign chan_b_ready = 'b1; // always high to avoid deadlock with two L1s.
 
     // Channel C now has two logical sources. This probe FSM and the miss
     // FSM's EVICT state (voluntary Release/ReleaseData). Both are funneled
     // through this one arbitrated assign so chan_c/chan_c_valid still only
-    // has a single driver. Fixed "probe always wins" priority is a
-    // placeholder; I am adding a real priority encoder for
-    // cross-channel contention later.
+    // has a single driver. Probe has priority over miss to avoid deadlock
     logic probe_c_req, evict_c_req;
     assign probe_c_req  = (probe_state == PROBE_SEND); // channel C is actively responding to probe
     assign evict_c_req  = (miss_state == EVICT); // channel C is actively releasing
@@ -398,11 +395,7 @@ import tilelink_pkg::*;
         next_probe_state = probe_state;
         case (probe_state)
             PROBE_IDLE: begin
-                if (chan_b_valid) next_probe_state = PROBE_RECEIVE; // proceed if channel b wants to initiate transaction
-            end
-
-            PROBE_RECEIVE: begin
-                if (chan_b_valid && chan_b_ready) next_probe_state = PROBE_SEND; // proceed to receive the data if L1 is ready for it
+                if (chan_b_valid) next_probe_state = PROBE_SEND; // proceed if channel b wants to initiate transaction
             end
 
             PROBE_SEND: begin
@@ -435,28 +428,28 @@ import tilelink_pkg::*;
             probe_beat_count <= '0;
         end else begin
             case (probe_state)
-            PROBE_IDLE: begin
-                if (chan_b_valid) begin // capture everything when data is valid
-                    probe_addr       <= chan_b.addr;
-                    probe_way        <= probe_in_way;
-                    probe_send_data  <= (chan_b.opcode == PROBE_BLOCK) && dirty1[{probe_in_index, probe_in_way}];
-                    probe_resp_param <= probe_in_resp_param;
-                    probe_new_perm   <= probe_in_new_perm;
-                    probe_size       <= chan_b.size;
-                    probe_beat_count <= '0; // defensive, start PROBE_SEND counting from 0
+                PROBE_IDLE: begin
+                    if (chan_b_valid) begin // capture everything when data is valid
+                        probe_addr       <= chan_b.addr;
+                        probe_way        <= probe_in_way;
+                        probe_send_data  <= (chan_b.opcode == PROBE_BLOCK) && dirty1[{probe_in_index, probe_in_way}];
+                        probe_resp_param <= probe_in_resp_param;
+                        probe_new_perm   <= probe_in_new_perm;
+                        probe_size       <= chan_b.size;
+                        probe_beat_count <= '0; // defensive, start PROBE_SEND counting from 0
+                    end
                 end
-            end
 
-            PROBE_SEND: begin
-                if (chan_c_valid && chan_c_ready) begin
-                    probe_beat_count <= probe_beat_count + 1'b1; // irrelevant once a single-beat ProbeAck has already left PROBE_SEND
+                PROBE_SEND: begin
+                    if (chan_c_valid && chan_c_ready) begin
+                        probe_beat_count <= probe_beat_count + 1'b1; // irrelevant once a single-beat ProbeAck has already left PROBE_SEND
+                    end
                 end
-            end
-            endcase
+                endcase
         end
     end
 
-    // Channel C content. same "probe wins" priority as chan_c_valid above
+    // Channel C content. same probe wins priority as chan_c_valid above
     always_comb begin
         if (probe_c_req) begin
             chan_c.opcode  = probe_send_data ? PROBE_ACK_DATA : PROBE_ACK;
@@ -465,11 +458,11 @@ import tilelink_pkg::*;
             chan_c.source  = L1_ID;
             chan_c.addr    = probe_addr;
             chan_c.data    = probe_send_data ? data1[{probe_reg_index, probe_way}][probe_beat_count] : '0;
-            chan_c.corrupt = 1'b0;
+            chan_c.corrupt = '0;
         end else begin
-            // evict_c_req. voluntary write-back of the line the incoming
+            // evict_c_req. voluntary write back of the line the incoming
             // miss is about to replace. saved_way/index still point at the
-            // victim's slot; the new line's tag/valid/perm/dirty are only
+            // victim's slot. the new line's tag/valid/perm/dirty are only
             // committed later, in the miss FSM's ACK state.
             chan_c.opcode  = saved_evict_dirty ? RELEASE_DATA : RELEASE;
             chan_c.param   = saved_evict_param;
