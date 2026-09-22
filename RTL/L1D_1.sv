@@ -48,6 +48,13 @@ import tilelink_pkg::*;
     logic                  dirty1 [0:L1_SETS*L1_WAYS-1]; // dirty cache for each row (16 entries)
     perm_t                 perms  [0:L1_SETS*L1_WAYS-1]; // permission cache for each row (16 entries)
 
+    // round-robin victim-way pointer, one bit per set. On a true miss
+    // (!tag_hit), hit_way is always 0 (see below), so it can't also serve
+    // as "which way to fill" -- without this, way 1 could never become
+    // valid. Toggled in ACK whenever a true-miss fill (not a same-line
+    // permission upgrade) commits.
+    logic rr_way1 [0:L1_SETS-1];
+
     // captured when a miss is first detected in IDLE, since ins.something/
     // the tag-hit way aren't guaranteed to still line up once beats
     // start arriving several cycles later
@@ -57,6 +64,7 @@ import tilelink_pkg::*;
     logic [SINK_WIDTH-1:0]  saved_sink;   // bookmark sent by D for D-E transaction. Echoed back on Channel E to close the transaction
     logic [BEAT_BITS-1:0]   beat_count;
     logic                   last_beat;
+    logic                   saved_new_fill; // true miss (needs a victim way), as opposed to a same-line upgrade
 
     // victim line's state, latched alongside saved_addr/saved_way at miss
     // detection. decides Release vs ReleaseData and the shrink_t param
@@ -71,6 +79,7 @@ import tilelink_pkg::*;
 
     logic hit_way0, hit_way1;
     logic tag_hit, hit_way, perm_ok, hit, wr_en;
+    logic victim_way; // which way a true miss should fill/evict, per the round-robin pointer
 
     assign offset   = ins.addr[OFFSET_BITS-1:0];
     assign index    = ins.addr[INDEX_BITS+OFFSET_BITS-1:OFFSET_BITS];
@@ -82,9 +91,12 @@ import tilelink_pkg::*;
     assign hit_way0 = valid1[{index, 1'b0}] && (tag1[{index, 1'b0}] == tag); // append 0 to choose set and way0
     assign hit_way1 = valid1[{index, 1'b1}] && (tag1[{index, 1'b1}] == tag); // append 1 to choose set and way1
     assign tag_hit  = hit_way0 || hit_way1;
-    // hit_way0/hit_way1 are mutually exclusive for a valid cache, so this also
-    // correctly defaults to way 0 on a true miss (tag_hit == 0)
+    // hit_way0/hit_way1 are mutually exclusive for a valid cache, so this
+    // correctly identifies the hit way whenever tag_hit is true. On a true
+    // miss (tag_hit == 0) it's always 0, which is meaningless as a fill
+    // target -- victim_way (below) is used for that case instead.
     assign hit_way  = hit_way1;
+    assign victim_way = rr_way1[index];
 
     // a load is satisfied by either B or T; a store needs exclusive (T) permission
     assign perm_ok = ins.opcode ? (perms[{index, hit_way}] == PERM_T)
@@ -98,6 +110,11 @@ import tilelink_pkg::*;
     // REQUEST when the fill has to replace an already-valid line; a
     // same-line permission upgrade (tag_hit but !perm_ok) skips straight
     // to REQUEST since there's nothing to write back.
+    //
+    // Declared here (ahead of its own always blocks below) because the
+    // probe section's evict_c_req needs miss_state/EVICT, and the miss
+    // FSM's own blocks need probe_c_req/probe_state from that section --
+    // Questa requires each declaration to textually precede every use.
     typedef enum logic [2:0] {
         IDLE         = 3'b000,
         EVICT        = 3'b001,
@@ -108,198 +125,6 @@ import tilelink_pkg::*;
     } miss_t;
 
     miss_t miss_state, next_miss_state;
-
-    always_ff @(posedge clk) begin
-        if (rst) miss_state <= IDLE;
-        else     miss_state <= next_miss_state;
-    end
-
-    // ------------------------------------------------------------------
-    // CPU-facing outputs. outs.stall tracks hit=false. true both
-    // on the first cycle a miss is discovered (miss_state still IDLE that
-    // cycle) and for every cycle the fill is outstanding after that, since
-    // hit stays low until the tag/valid/perm arrays are updated in ACK.
-    // Assumes the CPU holds ins stable while stall is asserted.
-    // ------------------------------------------------------------------
-    always_comb begin
-        outs.rdata = hit ? data1[{index, hit_way}][beat_sel] : '0; // assign output value depending on hit or miss
-        outs.stall = !hit; // stall when miss
-    end
-
-    // store hit: write through into the array and mark the line dirty
-    always_ff @(posedge clk) begin
-        if (wr_en) begin
-            data1[{index, hit_way}][beat_sel] <= ins.st_data;
-            dirty1[{index, hit_way}]          <= 1'b1;
-        end
-    end
-
-    // valid/ready for the channels miss FSM drives
-    assign chan_a_valid = (miss_state == REQUEST); // when channel A ACQUIRE is sent to L2
-    assign chan_d_ready = 'd1; // always high to avoid deadlock with this L1 and L2 due to another acquire
-    assign chan_e_valid = (miss_state == ACK); // when E responds with sink
-
-    // ------------------------------------------------------------------
-    // Next-state logic only, no outputs driven here
-    // ------------------------------------------------------------------
-    always_comb begin
-        next_miss_state = miss_state;
-        case (miss_state)
-            IDLE: begin
-                if (!hit) begin
-                    // a true miss (!tag_hit) reuses way0's slot. if that
-                    // slot already holds a valid line we have to write it
-                    // back first. A permission-only upgrade (tag_hit) never
-                    // evicts anything.
-                    if (!tag_hit && valid1[{index, hit_way}]) next_miss_state = EVICT;
-                    else next_miss_state = REQUEST;
-                end
-            end
-
-            EVICT: begin
-                // Channel C is arbitrated below (probe FSM wins ties); only
-                // count this as accepted if our Release/ReleaseData actually
-                // won the bus this cycle
-                if (!probe_c_req && chan_c_ready) begin
-                    if (!saved_evict_dirty || last_beat) next_miss_state = RELEASE_WAIT;
-                end
-            end
-
-            RELEASE_WAIT: begin
-                if (chan_d_valid && chan_d_ready && (chan_d.opcode == RELEASE_ACK)) next_miss_state = REQUEST;
-            end
-
-            REQUEST: begin
-                if (chan_a_valid && chan_a_ready) next_miss_state = WAIT; // L2 accepted the Acquire with successful handshake
-            end
-
-            WAIT: begin
-                if (chan_d_valid && chan_d_ready) begin
-                    case (chan_d.opcode)
-                        GRANT:      next_miss_state = ACK;                // PERM-only reply, done in one beat
-                        GRANT_DATA: if (last_beat) next_miss_state = ACK; // wait out all beats for ACQUIRE-PERM
-                        default:    next_miss_state = miss_state;
-                    endcase
-                end
-            end
-
-            ACK: begin
-                if (chan_e_valid && chan_e_ready) next_miss_state = IDLE; // GrantAck accepted, transaction closed
-            end
-
-            default: next_miss_state = IDLE;
-        endcase
-    end
-
-    // ------------------------------------------------------------------
-    // Sequential datapath: builds the Acquire on A, captures Channel D
-    // beats into data1, commits the tag/valid/perm arrays, and drives the
-    // GrantAck on E.
-    // ------------------------------------------------------------------
-    always_ff @(posedge clk) begin
-        if (rst) begin
-            saved_addr <= '0;
-            saved_way  <= '0;
-            saved_perm <= '0;
-            saved_sink <= '0;
-            beat_count <= '0;
-            saved_evict_dirty <= '0;
-            saved_evict_param <= '0;
-            chan_a     <= '0;
-            chan_e     <= '0;
-            for (int i = 0; i < L1_SETS*L1_WAYS; i++) valid1[i] <= 1'b0; // avoid X-valued lines looking like hits
-        end else begin
-            case (miss_state)
-            IDLE: begin
-                if (!hit) begin
-                    // latch everything the rest of the transaction needs
-                    // ins.addr isn't guaranteed to still be this request
-                    // once transaction several cycles into WAIT
-                    saved_addr <= ins.addr;
-                    saved_way  <= hit_way; // on miss it fills way0
-                    beat_count <= '0; // fresh count for whichever of EVICT/WAIT reads it next
-
-                    // only meaningful when EVICT is actually entered
-                    // (next_miss_state above); captured unconditionally
-                    // since it's cheap and harmless otherwise
-                    saved_evict_dirty <= dirty1[{index, hit_way}];
-                    saved_evict_param <= (perms[{index, hit_way}] == PERM_T) ? T_TO_N : B_TO_N;
-
-                    chan_a.size    <= SIZE_WIDTH'($clog2(LINE_BYTES));
-                    chan_a.source  <= L1_ID;
-                    chan_a.addr    <= ins.addr;
-                    chan_a.mask    <= '0; // whole line transfers only, never a partial write mask
-                    chan_a.data    <= '0; // Acquire carries no data, it comes back on GrantDATA
-                    chan_a.corrupt <= '0;
-
-                    if (tag_hit) begin
-                        // already hold the line, just need more permission.
-                        // Only reachable upgrade is B->T (a store
-                        // following an earlier load), since nothing
-                        // downgrades permissions yet.
-                        chan_a.opcode <= ACQUIRE_PERM;
-                        chan_a.param  <= B_TO_T; // store needs TIP permission
-                    end else begin
-                        // don't have the line at all. fetch it plus the
-                        // minimum permission the access needs
-                        chan_a.opcode <= ACQUIRE_BLOCK;
-                        chan_a.param  <= ins.opcode ? N_TO_T : N_TO_B; // store needs TIP, load needs BRANCH
-                    end
-                end
-            end
-
-            EVICT: begin
-                if (!probe_c_req && chan_c_ready) begin
-                    beat_count <= beat_count + 1'b1; // counts ReleaseData beats; harmless no-op path for a single-beat Release
-                end
-            end
-
-            REQUEST: begin
-                beat_count <= '0; // ensures counting in WAIT starts at 0
-            end
-
-            WAIT: begin
-                if (chan_d_valid && chan_d_ready) begin
-                    // TileLink repeats param/sink on every beat of GrantData,
-                    // so capturing them every accepted beat is safe
-                    saved_perm <= chan_d.param;
-                    saved_sink <= chan_d.sink;
-
-                    if (chan_d.opcode == GRANT_DATA) begin
-                        data1[{index, saved_way}][beat_count] <= chan_d.data; // assign each beat to data1
-                        beat_count <= beat_count + 1'b1; // wraps back to 0 on the last beat (BEAT_BITS-wide)
-                    end
-                end
-            end
-
-            ACK: begin
-                // commit the fill/upgrade while we hold GrantAck valid
-                tag1[{index, saved_way}]   <= saved_addr[ADDR_WIDTH-1:INDEX_BITS+OFFSET_BITS];
-                valid1[{index, saved_way}] <= 1'b1;
-                dirty1[{index, saved_way}] <= 1'b0; // freshly filled line is clean
-                case (saved_perm) // assign whatever permission it was assigned from chan D
-                    TO_T:    perms[{index, saved_way}] <= PERM_T;
-                    TO_B:    perms[{index, saved_way}] <= PERM_B;
-                    TO_N:    perms[{index, saved_way}] <= PERM_N;
-                    default: perms[{index, saved_way}] <= PERM_B;
-                endcase
-
-                chan_e.sink <= saved_sink;
-            end
-            endcase
-
-            // Channel B-C's permission-downgrade commit lives here rather
-            // than in the probe FSM's own always_ff below, even though
-            // it's that FSM's decision. perms/dirty1 already have this
-            // block as their writer, and a variable can only have one
-            // procedural driver, so a second always_ff writing them
-            // is a multiple-driver error.
-            if (probe_state == PROBE_SEND && chan_c_valid && chan_c_ready) begin
-                perms[{probe_reg_index, probe_way}] <= probe_new_perm;
-                if (probe_send_data) dirty1[{probe_reg_index, probe_way}] <= 1'b0;
-            end
-        end
-    end
 
     // CHANNEL B-C TRANSACTION (Probe / ProbeAck(Data))
 
@@ -471,6 +296,209 @@ import tilelink_pkg::*;
             chan_c.addr    = saved_addr;
             chan_c.data    = saved_evict_dirty ? data1[{index, saved_way}][beat_count] : '0;
             chan_c.corrupt = 1'b0;
+        end
+    end
+
+    always_ff @(posedge clk) begin
+        if (rst) miss_state <= IDLE;
+        else     miss_state <= next_miss_state;
+    end
+
+    // ------------------------------------------------------------------
+    // CPU-facing outputs. outs.stall tracks hit=false. true both
+    // on the first cycle a miss is discovered (miss_state still IDLE that
+    // cycle) and for every cycle the fill is outstanding after that, since
+    // hit stays low until the tag/valid/perm arrays are updated in ACK.
+    // Assumes the CPU holds ins stable while stall is asserted.
+    // ------------------------------------------------------------------
+    always_comb begin
+        outs.rdata = hit ? data1[{index, hit_way}][beat_sel] : '0; // assign output value depending on hit or miss
+        outs.stall = !hit; // stall when miss
+    end
+
+    // store hit: write through into the array and mark the line dirty
+    always_ff @(posedge clk) begin
+        if (wr_en) begin
+            data1[{index, hit_way}][beat_sel] <= ins.st_data;
+            dirty1[{index, hit_way}]          <= 1'b1;
+        end
+    end
+
+    // valid/ready for the channels miss FSM drives
+    assign chan_a_valid = (miss_state == REQUEST); // when channel A ACQUIRE is sent to L2
+    assign chan_d_ready = 'd1; // always high to avoid deadlock with this L1 and L2 due to another acquire
+    assign chan_e_valid = (miss_state == ACK); // when E responds with sink
+
+    // ------------------------------------------------------------------
+    // Next-state logic only, no outputs driven here
+    // ------------------------------------------------------------------
+    always_comb begin
+        next_miss_state = miss_state;
+        case (miss_state)
+            IDLE: begin
+                if (!hit) begin
+                    // a true miss (!tag_hit) targets the round-robin victim
+                    // way. if that slot already holds a valid line we have
+                    // to write it back first. A permission-only upgrade
+                    // (tag_hit) never evicts anything.
+                    if (!tag_hit && valid1[{index, victim_way}]) next_miss_state = EVICT;
+                    else next_miss_state = REQUEST;
+                end
+            end
+
+            EVICT: begin
+                // Channel C is arbitrated below (probe FSM wins ties); only
+                // count this as accepted if our Release/ReleaseData actually
+                // won the bus this cycle
+                if (!probe_c_req && chan_c_ready) begin
+                    if (!saved_evict_dirty || last_beat) next_miss_state = RELEASE_WAIT;
+                end
+            end
+
+            RELEASE_WAIT: begin
+                if (chan_d_valid && chan_d_ready && (chan_d.opcode == RELEASE_ACK)) next_miss_state = REQUEST;
+            end
+
+            REQUEST: begin
+                if (chan_a_valid && chan_a_ready) next_miss_state = WAIT; // L2 accepted the Acquire with successful handshake
+            end
+
+            WAIT: begin
+                if (chan_d_valid && chan_d_ready) begin
+                    case (chan_d.opcode)
+                        GRANT:      next_miss_state = ACK;                // PERM-only reply, done in one beat
+                        GRANT_DATA: if (last_beat) next_miss_state = ACK; // wait out all beats for ACQUIRE-PERM
+                        default:    next_miss_state = miss_state;
+                    endcase
+                end
+            end
+
+            ACK: begin
+                if (chan_e_valid && chan_e_ready) next_miss_state = IDLE; // GrantAck accepted, transaction closed
+            end
+
+            default: next_miss_state = IDLE;
+        endcase
+    end
+
+    // ------------------------------------------------------------------
+    // Sequential datapath: builds the Acquire on A, captures Channel D
+    // beats into data1, commits the tag/valid/perm arrays, and drives the
+    // GrantAck on E.
+    // ------------------------------------------------------------------
+    always_ff @(posedge clk) begin
+        if (rst) begin
+            saved_addr <= '0;
+            saved_way  <= '0;
+            saved_perm <= '0;
+            saved_sink <= '0;
+            beat_count <= '0;
+            saved_evict_dirty <= '0;
+            saved_evict_param <= '0;
+            chan_a     <= '0;
+            chan_e     <= '0;
+            saved_new_fill <= '0;
+            for (int i = 0; i < L1_SETS*L1_WAYS; i++) valid1[i] <= 1'b0; // avoid X-valued lines looking like hits
+            for (int i = 0; i < L1_SETS; i++) rr_way1[i] <= 1'b0;
+        end else begin
+            case (miss_state)
+            IDLE: begin
+                if (!hit) begin
+                    // latch everything the rest of the transaction needs
+                    // ins.addr isn't guaranteed to still be this request
+                    // once transaction several cycles into WAIT
+                    saved_addr <= ins.addr;
+                    // upgrade (tag_hit): keep the line's current way.
+                    // true miss: target the round-robin victim way.
+                    saved_way  <= tag_hit ? hit_way : victim_way;
+                    saved_new_fill <= !tag_hit;
+                    beat_count <= '0; // fresh count for whichever of EVICT/WAIT reads it next
+
+                    // only meaningful when EVICT is actually entered
+                    // (next_miss_state above); captured unconditionally
+                    // since it's cheap and harmless otherwise
+                    saved_evict_dirty <= dirty1[{index, victim_way}];
+                    saved_evict_param <= (perms[{index, victim_way}] == PERM_T) ? T_TO_N : B_TO_N;
+
+                    chan_a.size    <= SIZE_WIDTH'($clog2(LINE_BYTES));
+                    chan_a.source  <= L1_ID;
+                    chan_a.addr    <= ins.addr;
+                    chan_a.mask    <= '0; // whole line transfers only, never a partial write mask
+                    chan_a.data    <= '0; // Acquire carries no data, it comes back on GrantDATA
+                    chan_a.corrupt <= '0;
+
+                    if (tag_hit) begin
+                        // already hold the line, just need more permission.
+                        // Only reachable upgrade is B->T (a store
+                        // following an earlier load), since nothing
+                        // downgrades permissions yet.
+                        chan_a.opcode <= ACQUIRE_PERM;
+                        chan_a.param  <= B_TO_T; // store needs TIP permission
+                    end else begin
+                        // don't have the line at all. fetch it plus the
+                        // minimum permission the access needs
+                        chan_a.opcode <= ACQUIRE_BLOCK;
+                        chan_a.param  <= ins.opcode ? N_TO_T : N_TO_B; // store needs TIP, load needs BRANCH
+                    end
+                end
+            end
+
+            EVICT: begin
+                if (!probe_c_req && chan_c_ready) begin
+                    beat_count <= beat_count + 1'b1; // counts ReleaseData beats; harmless no-op path for a single-beat Release
+                end
+            end
+
+            REQUEST: begin
+                beat_count <= '0; // ensures counting in WAIT starts at 0
+            end
+
+            WAIT: begin
+                if (chan_d_valid && chan_d_ready) begin
+                    // TileLink repeats param/sink on every beat of GrantData,
+                    // so capturing them every accepted beat is safe
+                    saved_perm <= chan_d.param;
+                    saved_sink <= chan_d.sink;
+
+                    if (chan_d.opcode == GRANT_DATA) begin
+                        data1[{index, saved_way}][beat_count] <= chan_d.data; // assign each beat to data1
+                        beat_count <= beat_count + 1'b1; // wraps back to 0 on the last beat (BEAT_BITS-wide)
+                    end
+                end
+            end
+
+            ACK: begin
+                // commit the fill/upgrade while we hold GrantAck valid
+                tag1[{index, saved_way}]   <= saved_addr[ADDR_WIDTH-1:INDEX_BITS+OFFSET_BITS];
+                valid1[{index, saved_way}] <= 1'b1;
+                dirty1[{index, saved_way}] <= 1'b0; // freshly filled line is clean
+                case (saved_perm) // assign whatever permission it was assigned from chan D
+                    TO_T:    perms[{index, saved_way}] <= PERM_T;
+                    TO_B:    perms[{index, saved_way}] <= PERM_B;
+                    TO_N:    perms[{index, saved_way}] <= PERM_N;
+                    default: perms[{index, saved_way}] <= PERM_B;
+                endcase
+
+                // only alternate the pointer for a true-miss fill; an
+                // upgrade reused the line's existing way, so the next
+                // true miss to this set should still land on the way
+                // that wasn't just filled/refreshed
+                if (saved_new_fill) rr_way1[index] <= ~rr_way1[index];
+
+                chan_e.sink <= saved_sink;
+            end
+            endcase
+
+            // Channel B-C's permission-downgrade commit lives here rather
+            // than in the probe FSM's own always_ff below, even though
+            // it's that FSM's decision. perms/dirty1 already have this
+            // block as their writer, and a variable can only have one
+            // procedural driver, so a second always_ff writing them
+            // is a multiple-driver error.
+            if (probe_state == PROBE_SEND && chan_c_valid && chan_c_ready) begin
+                perms[{probe_reg_index, probe_way}] <= probe_new_perm;
+                if (probe_send_data) dirty1[{probe_reg_index, probe_way}] <= 1'b0;
+            end
         end
     end
 

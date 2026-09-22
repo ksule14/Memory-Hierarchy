@@ -4,34 +4,34 @@ package tilelink_pkg;
     parameter int DATA_WIDTH = 32; // data is 32 bits = 4 bytes
     parameter int LINE_BYTES = 16; // 16 bytes per cache line
     parameter int SIZE_WIDTH = 3; // size = 4 (log2(16)) so 3 bits needed
-    local parameter int BEATS = LINE_BYTES/(DATA_WIDTH/8); // data path is 4 bytes, need to transfer 16 bytes = 4 beats total
-    local parameter int SOURCE_WIDTH = 2; // L2 communicates with 4 L1s so 2 bits needed
-    local parameter int SINK_WIDTH = 2; // each L1 can have an outstanding grant, so 4 total = 2 bits
-    local parameter int OPCODE_WIDTH = 3; // 3 bits for the opcode
-    local parameter int PARAM_WIDTH = 3; // 3 bits for parameter (permission) changes
+    localparam int BEATS = LINE_BYTES/(DATA_WIDTH/8); // data path is 4 bytes, need to transfer 16 bytes = 4 beats total
+    localparam int SOURCE_WIDTH = 2; // L2 communicates with 4 L1s so 2 bits needed
+    localparam int SINK_WIDTH = 2; // each L1 can have an outstanding grant, so 4 total = 2 bits
+    localparam int OPCODE_WIDTH = 3; // 3 bits for the opcode
+    localparam int PARAM_WIDTH = 3; // 3 bits for parameter (permission) changes
 
     // CHANNEL A OPCODES (master -> student)
-    local parameter logic [2:0] PUT_FULL_DATA = 3'd0; // L2 writes full line back to main memory
-    local parameter logic [2:0] GET           = 3'd4; // L2 reads a line from main memory for cache fill
-    local parameter logic [2:0] ACQUIRE_BLOCK = 3'd6; // L1 reads a line from L2 and gets read and/or write permissions
-    local parameter logic [2:0] ACQUIRE_PERM  = 3'd7; // L1 asks L2 for permissions only, no data
+    localparam logic [2:0] PUT_FULL_DATA = 3'd0; // L2 writes full line back to main memory
+    localparam logic [2:0] GET           = 3'd4; // L2 reads a line from main memory for cache fill
+    localparam logic [2:0] ACQUIRE_BLOCK = 3'd6; // L1 reads a line from L2 and gets read and/or write permissions
+    localparam logic [2:0] ACQUIRE_PERM  = 3'd7; // L1 asks L2 for permissions only, no data
 
     // CHANNEL B OPCODES (student -> master)
-    local parameter logic [2:0] PROBE_BLOCK = 3'd6; // L2 downgrades L1 permissions and sends data back if dirty
-    local parameter logic [2:0] PROBE_PERM  = 3'd7; // same thing as ProbeBlock but does not take data back
+    localparam logic [2:0] PROBE_BLOCK = 3'd6; // L2 downgrades L1 permissions and sends data back if dirty
+    localparam logic [2:0] PROBE_PERM  = 3'd7; // same thing as ProbeBlock but does not take data back
 
     // CHANNEL C OPCODES (master -> student)
-    local parameter logic [2:0] PROBE_ACK      = 3'd4; // L1's reply to a probe where line is unmodified
-    local parameter logic [2:0] PROBE_ACK_DATA = 3'd5; // L1's reply to a ProbeBlock
-    local parameter logic [2:0] RELEASE        = 3'd6; // L1 voluntarily gives up permission on a clean line
-    local parameter logic [2:0] RELEASE_DATA   = 3'd7; // Same as Release but the line is dirty
+    localparam logic [2:0] PROBE_ACK      = 3'd4; // L1's reply to a probe where line is unmodified
+    localparam logic [2:0] PROBE_ACK_DATA = 3'd5; // L1's reply to a ProbeBlock
+    localparam logic [2:0] RELEASE        = 3'd6; // L1 voluntarily gives up permission on a clean line
+    localparam logic [2:0] RELEASE_DATA   = 3'd7; // Same as Release but the line is dirty
 
     // CHANNEL D OPCODES (student -> master)
-    local parameter logic [2:0] ACCESS_ACK      = 3'd0; // Main memory's acknowledgement of completed Put
-    local parameter logic [2:0] ACCESS_ACK_DATA = 3'd1; // Memory's respone to a Get, carrying requested data to L2
-    local parameter logic [2:0] GRANT           = 3'd4; // L2 response to any Acquire where no data is transferred
-    local parameter logic [2:0] GRANT_DATA      = 3'd5; // L2 response to Acquire Block
-    local parameter logic [2:0] RELEASE_ACK     = 3'd6; // L2 acknowledgement for Release or ReleaseData
+    localparam logic [2:0] ACCESS_ACK      = 3'd0; // Main memory's acknowledgement of completed Put
+    localparam logic [2:0] ACCESS_ACK_DATA = 3'd1; // Memory's respone to a Get, carrying requested data to L2
+    localparam logic [2:0] GRANT           = 3'd4; // L2 response to any Acquire where no data is transferred
+    localparam logic [2:0] GRANT_DATA      = 3'd5; // L2 response to Acquire Block
+    localparam logic [2:0] RELEASE_ACK     = 3'd6; // L2 acknowledgement for Release or ReleaseData
 
 
     // used in tag array to identify what permission each line has
