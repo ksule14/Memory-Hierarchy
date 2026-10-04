@@ -18,7 +18,8 @@ import tilelink_pkg::*;
 module l2_bfm #(
     parameter int MAX_READY_DELAY_INIT = 0, // initial value; change at runtime with set_delays()
     parameter int MAX_VALID_DELAY_INIT = 0,
-    parameter logic [1:0] EXPECTED_SOURCE = 2'd1 // this L1's fixed TileLink source id, checked against chan_a/chan_c
+    parameter logic [1:0] EXPECTED_SOURCE = 2'd1, // this L1's fixed TileLink source id, checked against chan_a/chan_c
+    parameter bit         CHECK_SOURCE    = 1'b1  // 0 when several L1s share this BFM through l2_controller
 )(
     input  logic clk,
     input  logic rst,
@@ -85,6 +86,11 @@ module l2_bfm #(
     // ------------------------------------------------------------------
     semaphore d_lock = new(1); // chan_d is driven by both the Acquire responder and the Release acker
 
+    initial begin
+        chan_d       = '0;
+        chan_d_valid = 1'b0; // otherwise X until the first response, tripping d_valid_known
+    end
+
     // runtime-adjustable backpressure knobs (0 = deterministic/always-ready,
     // matching most directed tests; set_delays() dials in fuzzing for the
     // specific tests that want it)
@@ -117,7 +123,11 @@ module l2_bfm #(
         while (!chan_a_valid) @(negedge clk);
         repeat (rand_delay(max_ready_delay)) @(negedge clk);
         chan_a_ready <= 1'b1;
+        // a beat only counts on a posedge where valid is actually high. valid
+        // seen at the negedge can still fall before the posedge when it's
+        // combinational from other inputs (l2_controller's channel priority)
         @(posedge clk);
+        while (!chan_a_valid) @(posedge clk);
         req = chan_a;
         @(negedge clk);
         chan_a_ready <= 1'b0;
@@ -128,7 +138,11 @@ module l2_bfm #(
         while (!chan_c_valid) @(negedge clk);
         repeat (rand_delay(max_ready_delay)) @(negedge clk);
         chan_c_ready <= 1'b1;
+        // a beat only counts on a posedge where valid is actually high. valid
+        // seen at the negedge can still fall before the posedge when it's
+        // combinational from other inputs (l2_controller's channel priority)
         @(posedge clk);
+        while (!chan_c_valid) @(posedge clk);
         beat = chan_c;
         @(negedge clk);
         chan_c_ready <= 1'b0;
@@ -151,7 +165,7 @@ module l2_bfm #(
             accept_a_beat(req);
             acquire_count++;
 
-            if (req.source !== EXPECTED_SOURCE)
+            if (CHECK_SOURCE && req.source !== EXPECTED_SOURCE)
                 $error("l2_bfm: chan_a.source=%0d, expected %0d", req.source, EXPECTED_SOURCE);
 
             resp.sink    = '0;
@@ -192,7 +206,7 @@ module l2_bfm #(
             automatic channel_c beat;
             accept_c_beat(beat);
 
-            if (beat.source !== EXPECTED_SOURCE)
+            if (CHECK_SOURCE && beat.source !== EXPECTED_SOURCE)
                 $error("l2_bfm: chan_c.source=%0d, expected %0d", beat.source, EXPECTED_SOURCE);
 
             case (beat.opcode)
@@ -250,6 +264,7 @@ module l2_bfm #(
             repeat (rand_delay(max_ready_delay)) @(negedge clk);
             chan_e_ready <= 1'b1;
             @(posedge clk);
+            while (!chan_e_valid) @(posedge clk); // same posedge-handshake rule as accept_a_beat
             @(negedge clk);
             chan_e_ready <= 1'b0;
         end

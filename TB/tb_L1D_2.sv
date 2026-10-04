@@ -62,16 +62,73 @@ module tb_L1D_2;
     );
 
     // ------------------------------------------------------------------
-    // CPU-side driver
+    // CPU-side driver. The cache is non-blocking: cpu_issue only waits for
+    // the request to be accepted (valid && !stall), and responses are
+    // collected by id in the background by the monitor below, so a test
+    // can have several requests in flight and check completion order.
     // ------------------------------------------------------------------
-    task automatic cpu_op(input logic op, input logic [ADDR_WIDTH-1:0] a,
-                           input logic [DATA_WIDTH-1:0] wdata, output logic [DATA_WIDTH-1:0] rdata);
-        ins.opcode  <= op;
-        ins.addr    <= a;
-        ins.st_data <= wdata;
+    localparam int NUM_IDS = 2**CPU_ID_WIDTH;
+
+    int errors = 0; // declared up here because the response monitor below also bumps it
+
+    logic [CPU_ID_WIDTH-1:0] next_id = '0;
+    bit                      resp_seen  [NUM_IDS];
+    logic [DATA_WIDTH-1:0]   resp_rdata [NUM_IDS];
+    int                      resp_order [$]; // ids in the order their responses came back
+    bit                      saw_stall;      // set whenever a presented request was pushed back
+
+    // outs.valid/id/rdata are registered, so sampling at posedge sees the
+    // value the DUT held for the whole previous cycle, exactly once
+    always @(posedge clk) begin
+        if (!rst && outs.valid) begin
+            if (resp_seen[outs.id]) begin
+                errors++;
+                $error("CHECK FAILED: duplicate response for id %0d", outs.id);
+            end
+            resp_seen[outs.id]  = 1'b1;
+            resp_rdata[outs.id] = outs.rdata;
+            resp_order.push_back(outs.id);
+        end
+        if (!rst && ins.valid && outs.stall) saw_stall = 1'b1;
+    end
+
+    // present one request starting at the next negedge, hold it until the
+    // posedge it's accepted on, then return (leaving it on the bus so a
+    // following cpu_issue can go back-to-back). Call cpu_idle when done.
+    task automatic cpu_issue(input logic op, input logic [ADDR_WIDTH-1:0] a,
+                              input logic [DATA_WIDTH-1:0] wdata, output logic [CPU_ID_WIDTH-1:0] id);
+        @(negedge clk);
+        id = next_id;
+        next_id++;
+        resp_seen[id] = 1'b0;
+        ins = '{valid: 1'b1, opcode: op, id: id, addr: a, st_data: wdata};
         @(posedge clk);
         while (outs.stall) @(posedge clk);
-        rdata = outs.rdata;
+    endtask
+
+    task automatic cpu_idle();
+        @(negedge clk);
+        ins.valid = 1'b0;
+    endtask
+
+    task automatic cpu_wait(input logic [CPU_ID_WIDTH-1:0] id, output logic [DATA_WIDTH-1:0] rdata);
+        wait (resp_seen[id] === 1'b1);
+        rdata = resp_rdata[id];
+    endtask
+
+    function automatic int resp_pos(input logic [CPU_ID_WIDTH-1:0] id);
+        foreach (resp_order[i]) if (resp_order[i] == id) return i;
+        return -1;
+    endfunction
+
+    // one request at a time, waits for its response (used by the original
+    // directed tests, which don't care about overlap)
+    task automatic cpu_op(input logic op, input logic [ADDR_WIDTH-1:0] a,
+                           input logic [DATA_WIDTH-1:0] wdata, output logic [DATA_WIDTH-1:0] rdata);
+        automatic logic [CPU_ID_WIDTH-1:0] id;
+        cpu_issue(op, a, wdata, id);
+        cpu_idle();
+        cpu_wait(id, rdata);
     endtask
 
     task automatic cpu_load(input logic [ADDR_WIDTH-1:0] a, output logic [DATA_WIDTH-1:0] rdata);
@@ -85,7 +142,7 @@ module tb_L1D_2;
 
     task automatic do_reset();
         rst = 1'b1;
-        ins = '{opcode: 1'b0, addr: '0, st_data: '0};
+        ins = '{valid: 1'b0, opcode: 1'b0, id: '0, addr: '0, st_data: '0};
         repeat (3) @(posedge clk);
         rst = 1'b0;
         @(posedge clk);
@@ -98,7 +155,6 @@ module tb_L1D_2;
     // ------------------------------------------------------------------
     // self-checking
     // ------------------------------------------------------------------
-    int errors = 0;
     task automatic check(input bit cond, input string msg);
         if (!cond) begin
             errors++;
@@ -112,7 +168,9 @@ module tb_L1D_2;
     task automatic test_reset();
         check(dut.miss_state == dut.IDLE, "reset: miss_state should be IDLE");
         check(dut.probe_state == dut.PROBE_IDLE, "reset: probe_state should be PROBE_IDLE");
-        check(outs.stall === 1'b1, "reset: outs.stall should be high (nothing valid yet)");
+        check(outs.stall === 1'b0, "reset: outs.stall should be low (no request presented, buffer empty)");
+        check(outs.valid === 1'b0, "reset: no response should be pending");
+        check(dut.rq_count == 0, "reset: request buffer should be empty");
     endtask
 
     // plain load miss: fill with N_TO_B, verify data + PERM_B, no dirty
@@ -286,6 +344,133 @@ module tb_L1D_2;
     endtask
 
     // ------------------------------------------------------------------
+    // non-blocking behavior
+    // ------------------------------------------------------------------
+
+    // hit-under-miss: start a miss, then hit a resident line (different set,
+    // so the miss can't be evicting it). The hits must come back while the
+    // miss is still outstanding, without issuing any extra Acquire
+    task automatic test_hit_under_miss();
+        automatic logic [ADDR_WIDTH-1:0] h = mk_addr(9'h100, 3'd1); // made resident first
+        automatic logic [ADDR_WIDTH-1:0] m = mk_addr(9'h101, 3'd2); // the outstanding miss
+        automatic logic [CPU_ID_WIDTH-1:0] id_m, id_h0, id_h1;
+        automatic logic [DATA_WIDTH-1:0] rdata;
+        automatic int acq_before;
+
+        cpu_load(h, rdata);
+        resp_order.delete();
+        acq_before = bfm.acquire_count;
+
+        cpu_issue(1'b0, m, '0, id_m);
+        cpu_issue(1'b0, h, '0, id_h0);
+        cpu_issue(1'b0, h + 16'd4, '0, id_h1); // beat 1 of the same resident line
+        cpu_idle();
+
+        cpu_wait(id_h1, rdata);
+        check(rdata == bfm.default_fill(h, 1), "hit-under-miss: beat-1 hit data mismatch");
+        check(!resp_seen[id_m], "hit-under-miss: hits should complete while the miss is still outstanding");
+        check(dut.miss_state != dut.IDLE, "hit-under-miss: MSHR should still be busy when the hits return");
+        cpu_wait(id_h0, rdata);
+        check(rdata == bfm.default_fill(h, 0), "hit-under-miss: beat-0 hit data mismatch");
+        cpu_wait(id_m, rdata);
+        check(rdata == bfm.default_fill(m, 0), "hit-under-miss: miss data mismatch");
+        check(resp_pos(id_h0) < resp_pos(id_m) && resp_pos(id_h1) < resp_pos(id_m),
+              "hit-under-miss: both hits should be answered before the miss");
+        check(bfm.acquire_count == acq_before + 1, "hit-under-miss: only the miss should have issued an Acquire");
+    endtask
+
+    // miss-under-miss + same-line merge: a store miss, a load to the same
+    // (still missing) line, a miss to an unrelated line, then a hit. The
+    // same-line load must wait behind the store and see its data without
+    // a second Acquire; the unrelated miss is latched until the MSHR frees;
+    // the hit bypasses everything
+    task automatic test_miss_under_miss_merge();
+        automatic logic [ADDR_WIDTH-1:0] a = mk_addr(9'h110, 3'd5);
+        automatic logic [ADDR_WIDTH-1:0] b = mk_addr(9'h111, 3'd6);
+        automatic logic [ADDR_WIDTH-1:0] h = mk_addr(9'h100, 3'd1); // still resident from test_hit_under_miss
+        automatic logic [CPU_ID_WIDTH-1:0] id_st, id_ld, id_b, id_h;
+        automatic logic [DATA_WIDTH-1:0] rdata;
+        automatic int acq_before;
+
+        resp_order.delete();
+        acq_before = bfm.acquire_count;
+
+        cpu_issue(1'b1, a, 32'hFEED_0001, id_st);
+        cpu_issue(1'b0, a, '0, id_ld);
+        cpu_issue(1'b0, b, '0, id_b);
+        cpu_issue(1'b0, h, '0, id_h);
+        cpu_idle();
+
+        cpu_wait(id_st, rdata);
+        cpu_wait(id_ld, rdata);
+        check(rdata == 32'hFEED_0001, "merge: load after a store to the same missing line must see the store");
+        cpu_wait(id_b, rdata);
+        check(rdata == bfm.default_fill(b, 0), "merge: queued second miss data mismatch");
+        cpu_wait(id_h, rdata);
+        check(rdata == bfm.default_fill(h, 0), "merge: bypassing hit data mismatch");
+
+        check(resp_pos(id_h) < resp_pos(id_st), "merge: the hit should bypass the outstanding miss");
+        check(resp_pos(id_st) < resp_pos(id_ld), "merge: same-line requests must complete in program order");
+        check(resp_pos(id_ld) < resp_pos(id_b), "merge: the queued miss should only start after the first one finished");
+        check(bfm.acquire_count == acq_before + 2, "merge: the same-line load should not have issued its own Acquire");
+    endtask
+
+    // more outstanding misses than the request buffer holds: stall must
+    // push back on the CPU, nothing may be dropped, and misses (which all
+    // funnel through the one MSHR) complete in the order they were issued
+    task automatic test_buffer_full_stall();
+        localparam int N = 6;
+        automatic logic [ADDR_WIDTH-1:0]   addrs [N];
+        automatic logic [CPU_ID_WIDTH-1:0] ids   [N];
+        automatic logic [DATA_WIDTH-1:0]   rdata;
+
+        resp_order.delete();
+        saw_stall = 1'b0;
+        bfm.set_delays(2, 2); // stretch each miss so the buffer actually fills
+
+        for (int i = 0; i < N; i++) begin
+            addrs[i] = mk_addr(9'h130 + 9'(i), 3'(i));
+            cpu_issue(1'b0, addrs[i], '0, ids[i]);
+        end
+        cpu_idle();
+
+        for (int i = 0; i < N; i++) begin
+            cpu_wait(ids[i], rdata);
+            check(rdata == bfm.default_fill(addrs[i], 0), $sformatf("buffer-full: miss %0d data mismatch", i));
+            if (i > 0) check(resp_pos(ids[i-1]) < resp_pos(ids[i]), $sformatf("buffer-full: miss %0d completed out of order", i));
+        end
+        check(saw_stall, "buffer-full: stall should assert once the request buffer is full");
+        bfm.set_delays(0, 0);
+    endtask
+
+    // a store to the line that the in-flight miss is evicting. Without the
+    // victim-line conflict check it would hit the old copy mid-ReleaseData
+    // and then be overwritten by the fill, i.e. silently lost
+    task automatic test_store_to_victim_during_evict();
+        automatic logic [ADDR_WIDTH-1:0] x = mk_addr(9'h120, 3'd3); // becomes the victim
+        automatic logic [ADDR_WIDTH-1:0] z = mk_addr(9'h121, 3'd3);
+        automatic logic [ADDR_WIDTH-1:0] y = mk_addr(9'h122, 3'd3); // evicts x
+        automatic logic [CPU_ID_WIDTH-1:0] id_y, id_x;
+        automatic logic [DATA_WIDTH-1:0] rdata;
+
+        cpu_store(x, 32'h1111_1111); // fills way rr[3], pointer flips
+        cpu_store(z, 32'h2222_2222); // fills the other way, pointer back on x's way
+        resp_order.delete();
+
+        cpu_issue(1'b0, y, '0, id_y);
+        cpu_issue(1'b1, x, 32'h3333_3333, id_x);
+        cpu_idle();
+
+        cpu_wait(id_y, rdata);
+        check(rdata == bfm.default_fill(y, 0), "victim-store: evicting miss data mismatch");
+        cpu_wait(id_x, rdata);
+        check(resp_pos(id_y) < resp_pos(id_x), "victim-store: store to the victim must wait for the eviction");
+        check(bfm.read_beat(x, 0) == 32'h1111_1111, "victim-store: eviction should write back x's pre-store contents");
+        cpu_load(x, rdata);
+        check(rdata == 32'h3333_3333, "victim-store: the store to the victim line was lost");
+    endtask
+
+    // ------------------------------------------------------------------
     // main sequence
     // ------------------------------------------------------------------
     initial begin
@@ -301,6 +486,10 @@ module tb_L1D_2;
         test_probe_dirty();
         test_probe_during_evict();
         test_backpressure();
+        test_hit_under_miss();
+        test_miss_under_miss_merge();
+        test_buffer_full_stall();
+        test_store_to_victim_during_evict();
 
         if (errors == 0) $display("TB_L1D_2: ALL TESTS PASSED");
         else              $display("TB_L1D_2: %0d CHECK(S) FAILED", errors);

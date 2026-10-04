@@ -121,15 +121,24 @@ package tilelink_pkg;
         logic [SINK_WIDTH-1:0] sink; // sends save value as sink on channel D back to D as grant ack.
     } channel_e;
 
-    // cpu requests and responses
+    // cpu requests and responses. The L1s are non-blocking, so a request is
+    // a valid/ready handshake (accepted on any cycle with valid && !stall)
+    // and its response comes back later, possibly out of order with respect
+    // to other requests, tagged with the id the CPU sent it with.
+    parameter int CPU_ID_WIDTH = 3; // CPU must not reuse an id that is still waiting on its response
+
     typedef struct packed {
-        logic                  opcode;
-        logic [ADDR_WIDTH-1:0] addr;
-        logic [DATA_WIDTH-1:0] st_data;
+        logic                    valid;  // a request is being presented this cycle
+        logic                    opcode; // 0 = load, 1 = store
+        logic [CPU_ID_WIDTH-1:0] id;     // echoed back on the matching response
+        logic [ADDR_WIDTH-1:0]   addr;
+        logic [DATA_WIDTH-1:0]   st_data;
     } cpu_req_t;
 
     typedef struct packed {
-        logic [DATA_WIDTH-1:0] rdata;
-        logic                  stall;
+        logic                    valid; // one-cycle pulse, a request has completed
+        logic [CPU_ID_WIDTH-1:0] id;    // which request completed
+        logic [DATA_WIDTH-1:0]   rdata; // load data (0 for a store)
+        logic                    stall; // request buffer can't take the presented request, hold it
     } cpu_resp_t;
 endpackage
