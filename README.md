@@ -11,7 +11,7 @@ The goal is understanding, not raw performance. The design keeps the parts that 
 1. [Block Diagram](#block-diagram)
 2. [What is TileLink?](#what-is-tilelink)
 3. [Why TileLink?](#why-tilelink)
-4. [Our Simplified TileLink](#our-simplified-tilelink)
+4. [My Simplified TileLink](#my-simplified-tilelink)
 5. [System Architecture](#system-architecture)
 6. [Example Transactions](#example-transactions)
 7. [Repository Layout](#repository-layout)
@@ -100,7 +100,7 @@ On every channel, the sender drives `valid` together with the message, and the r
 
 ---
 
-## Our Simplified TileLink
+## My Simplified TileLink
 
 This project implements a **subset** of TL-C. Everything is defined in [`RTL/tilelink_pkg.sv`](RTL/tilelink_pkg.sv).
 
@@ -130,7 +130,7 @@ This project implements a **subset** of TL-C. Everything is defined in [`RTL/til
 
 So the L1 ↔ L2 link is **TL-C**, and the L2 ↔ memory link is a small **TL-UH** subset (whole-line `Get` and `PutFullData` bursts only).
 
-### What we simplified
+### What I simplified
 
 - **Whole-line transfers only.** Every data message is a full 16-byte, 4-beat burst. There are no partial writes (`PutPartialData`), so `mask` is unused.
 - **No atomics, hints or arithmetic/logical operations** (`ArithmeticData`, `LogicalData`, `Intent`).
@@ -313,7 +313,7 @@ These are deliberate simplifications or known gaps, not hidden bugs.
 - **Subset of TL-C.** No `PutPartialData`, atomics, hints, `ProbePerm`, or error reporting (`corrupt`/`denied`). Every transfer is exactly one 16-byte line.
 - **One transaction per master.** Each L1 has a single source ID, so it can have only one Acquire outstanding. Hit-under-miss is supported, but not miss-under-miss.
 - **No Exclusive (E) state.** A read always gets B, even when no other cache holds the line, so the first store to a line that was read first always needs an `AcquirePerm` round trip.
-- **`AcquirePerm` may be answered with `GrantData`** (see [What we simplified](#what-we-simplified)). Strict TileLink only allows `Grant` there.
+- **`AcquirePerm` may be answered with `GrantData`** (see [What I simplified](#what-I-simplified)). Strict TileLink only allows `Grant` there.
 
 ### L2 and memory performance
 
