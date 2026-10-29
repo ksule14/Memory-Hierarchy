@@ -217,7 +217,7 @@ Main features:
 
 ### Main memory — [`RTL/main_memory.sv`](RTL/main_memory.sv)
 
-- 64 KB of BRAM (16 K × 32-bit words), loaded at startup from `RTL/initial_ram.hex` with `$readmemh`.
+- 64 KB of BRAM (16 K × 32-bit words). Every word starts at zero, then the file named by the `INIT_FILE` parameter (default `initial_ram.hex`) is loaded with `$readmemh` if it exists and isn't empty. Words the file doesn't cover stay zero, so a read never puts X on channel D.
 - Serves `Get` with four `AccessAckData` beats, and `PutFullData` (four beats in) with a single `AccessAck`.
 - Handles one request at a time with a small FSM (`IDLE → READ ⇄ RESPOND` for reads, `IDLE → WRITE → ACK` for writes). The one-cycle BRAM read latency is covered by the `READ` state.
 
@@ -275,13 +275,15 @@ RTL/
   L2_controller.sv      Interconnect: round-robin arbiters (A/C/E) and source routers (B/D)
   L2.sv                 Shared inclusive L2 with directory-based coherence
   main_memory.sv        64 KB BRAM main memory (Get / PutFullData)
-  initial_ram.hex       Main memory initial contents
+  initial_ram.hex       Optional main memory initial contents (currently empty, so memory starts zeroed)
 
 TB/
   tb_L1D_1.sv           L1_cache1 in isolation against a behavioural L2 model
   tb_L1D_2.sv           L1_cache2 in isolation (mirrors tb_L1D_1)
   tb_L2_controller.sv   Interconnect unit test with scripted L1/L2 drivers
   tb_L1s_L2_controller.sv  Both real L1s through the real interconnect into the L2 model
+  tb_main_memory.sv     Main memory in isolation: Get / PutFullData against a reference model
+  tb_system.sv          Full system: both L1s, interconnect, real L2 and main memory
   l1d_bfm.sv            Behavioural L2 model (l2_bfm) used by the tests above
   l1d_internal_checks.sv  Internal L1 invariants, bound into the L1 testbenches
   tl_chan_checker.sv    Assertions for TileLink valid/ready/payload rules on every channel
@@ -296,9 +298,16 @@ Testing was built up from the bottom:
 1. **Each L1 in isolation** (`tb_L1D_1`, `tb_L1D_2`). Each cache talks to `l2_bfm`, a behavioural L2 that can inject probes on exact cycles, for example in the middle of an eviction, and insert random stalls on every channel.
 2. **The interconnect alone** (`tb_L2_controller`). Scripted drivers on both sides check round-robin rotation, sticky grants, burst locking, channel priority and routing by source.
 3. **Both L1s through the interconnect** (`tb_L1s_L2_controller`). The real caches run eviction-heavy traffic at the same time through the real interconnect into `l2_bfm`.
-4. **Full system.** Both L1s, the interconnect, the real L2 and main memory have been run together with a reference model checking every load: directed sharing, upgrade and ping-pong cases, followed by concurrent random loads and stores from both CPUs to a small set of addresses that forces constant L2 evictions and back-invalidations. *(This full-system testbench hasn't been added to `TB/` yet.)*
+4. **Main memory alone** (`tb_main_memory`). A scripted L2-side driver sends whole-line `Get` and `PutFullData` bursts, and a reference model checks read data. Each response's opcode, source echo, size, beat count and `corrupt`/`denied` are also checked. It covers never-written lines reading zero, the first and last lines, neighbouring lines (a burst must not spill into the next one), overwrites and a random mix of requests. It runs once with no stalls and again with random `d_ready` stalls and gaps between `PutFullData` beats.
+5. **Full system** (`tb_system`). Both L1s, the interconnect, the real L2 and main memory run together:
+   - **Directed cases:** cold misses to memory, sharing, upgrades, ping-pong stores between the caches, and L2 evictions that write dirty lines back to memory and read them again.
+   - **Random traffic:** both CPUs issue concurrent loads and stores to lines that all land in two L2 sets, which forces constant L2 evictions, back-invalidations and writebacks. Each CPU owns two words of every line, so the lines keep moving between caches (false sharing).
+   - **Load checks:** a load of a CPU's own word must return exactly its last store. A load of the other CPU's word must return a value that CPU stored, and never an older one than already seen.
+   - **Final sweep:** every word is read back from both caches.
 
-Every channel in the unit and integration testbenches is covered by `tl_chan_checker` assertions: `valid` may not drop before `ready`, the payload may not change while waiting, and nothing may be X.
+Every channel in the unit and integration testbenches, including the L2 ↔ memory channels in `tb_system`, is covered by `tl_chan_checker` assertions: `valid` may not drop before `ready`, the payload may not change while waiting, and nothing may be X.
+
+Each testbench prints `<NAME>: ALL TESTS PASSED` when every check passes. All six pass in the current regression.
 
 The simulations were run in **Questa**. Compile `RTL/tilelink_pkg.sv` first, since every other file imports it.
 
@@ -326,9 +335,9 @@ These are deliberate simplifications or known gaps, not hidden bugs.
 
 - **Two L1s in practice.** The interconnect and L2 directory support four source IDs, but only two L1 data caches exist. Ports 0 and 3 are tied off in the testbenches.
 - **No instruction caches**, and no processor core. The CPU side is driven directly by testbenches.
-- **No top-level wrapper** connects the full system yet, and there's no full-system testbench in `TB/` yet either.
+- **No top-level wrapper** connects the full system yet. The full system is only assembled inside `tb_system`.
 - **The two L1s are separate, hand-written modules** (`L1_cache1`, `L1_cache2`) rather than one module with a parameter. Changes have to be made in both.
-- **`initial_ram.hex` is currently empty**, so main memory reads return X until an address is written. Fill it before running anything that reads memory it didn't write first.
+- **`initial_ram.hex` is currently empty**, so main memory starts with all zeros. To preload data, fill it (or point `INIT_FILE` at another file) with one 32-bit hex word per line, starting at word address 0.
 - **Inclusion costs capacity.** Because the L2 is inclusive, evicting an L2 line forces any L1 copies out too, and L1 contents always use up L2 space.
 
 ### L1 behaviour the L2 relies on

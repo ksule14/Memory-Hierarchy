@@ -1,5 +1,17 @@
-module main_memory 
+// Main memory. Sits behind l2_cache, which is its only client, and speaks
+// the TL-UL/UH subset the L2 uses on its memory side:
+//   - Get:         answered with BEATS AccessAckData beats (one line)
+//   - PutFullData: BEATS beats in, answered with one dataless AccessAck
+// Every transfer is one whole, line-aligned LINE_BYTES line, so beat n
+// always maps to word n of the line. One request is handled at a time.
+//
+// Words that were never written and aren't set by INIT_FILE read as zero,
+// so a read never returns X onto channel D.
+module main_memory
     import tilelink_pkg::*;
+#(
+    parameter string INIT_FILE = "initial_ram.hex" // relative to the sim/synth run directory. "" skips loading
+)
 (
     input logic         clk,
     input logic         rst,
@@ -19,10 +31,24 @@ module main_memory
     localparam WORD_AW = $clog2(MEM_DEPTH); // width of word address, not byte address
     localparam BYTE_OFF = $clog2(DATA_WIDTH/8); // BYTE_OFF = 2. byte offset that differentiates word address and byte address
     // 64KB address space
-    (* ram_style = "block" *) logic [DATA_WIDTH-1:0] ram [0:MEM_DEPTH-1];
+    (* ram_style = "block" *) logic [DATA_WIDTH-1:0] ram [0:MEM_DEPTH-1] = '{default: '0}; // anything the hex file doesn't cover reads as zero
     
     initial begin // initialize main memory
-        $readmemh("initial_ram.hex", ram);
+`ifndef SYNTHESIS
+        // only load a file that exists and isn't empty, otherwise $readmemh
+        // warns and the zero fill above stays as the contents
+        if (INIT_FILE != "") begin
+            int fd;
+            fd = $fopen(INIT_FILE, "r");
+            if (fd == 0) $display("main_memory: %s not found, memory starts zeroed", INIT_FILE);
+            else begin
+                if ($fgetc(fd) != -1) $readmemh(INIT_FILE, ram);
+                $fclose(fd);
+            end
+        end
+`else
+        if (INIT_FILE != "") $readmemh(INIT_FILE, ram);
+`endif
     end
 
     // states that main memory can be in
